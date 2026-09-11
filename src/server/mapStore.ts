@@ -1,5 +1,6 @@
 import { copyFile, mkdir, readdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { constants as fsConstants } from 'node:fs';
+import { createHash } from 'node:crypto';
 import path from 'node:path';
 import {
   addPaintStroke,
@@ -62,6 +63,12 @@ import {
   type ColorPalette,
   type ColorPaletteInput
 } from '../shared/colorPalette';
+import {
+  cinematicSummary,
+  normalizeCinematic,
+  type CinematicDocument,
+  type CinematicSummary
+} from '../shared/cinematic';
 
 export interface MapStoreOptions {
   rootDir?: string;
@@ -115,6 +122,7 @@ export class MapStore {
   private readonly trashDir: string;
   private readonly renderSchemesDir: string;
   private readonly colorPalettesDir: string;
+  private readonly cinematicsDir: string;
   private readonly hdriDir: string;
   private readonly sharedHdriDir: string;
   private readonly starterDataDir: string | null;
@@ -132,6 +140,7 @@ export class MapStore {
     this.trashDir = path.join(this.rootDir, 'trash');
     this.renderSchemesDir = path.join(this.rootDir, 'render-schemes');
     this.colorPalettesDir = path.join(this.rootDir, 'color-palettes');
+    this.cinematicsDir = path.join(this.rootDir, 'cinematics');
     this.hdriDir = path.join(this.rootDir, 'hdri');
     this.sharedHdriDir = options.sharedHdriDir ?? path.join(process.cwd(), 'assets', 'hdri');
     this.starterDataDir = options.starterDataDir === undefined
@@ -149,6 +158,7 @@ export class MapStore {
     await mkdir(this.trashDir, { recursive: true });
     await mkdir(this.renderSchemesDir, { recursive: true });
     await mkdir(this.colorPalettesDir, { recursive: true });
+    await mkdir(this.cinematicsDir, { recursive: true });
     await mkdir(this.hdriDir, { recursive: true });
     await this.syncStarterData();
   }
@@ -582,6 +592,58 @@ export class MapStore {
     });
     await writeFile(this.assetPath(asset.id), `${JSON.stringify(asset, null, 2)}\n`, 'utf8');
     return asset;
+  }
+
+  async listCinematicSummaries(projectId?: string): Promise<CinematicSummary[]> {
+    await this.ensureReady();
+    const projectDirs = projectId
+      ? [safeId(projectId)]
+      : (await readdir(this.cinematicsDir, { withFileTypes: true }).catch(() => []))
+        .filter((entry) => entry.isDirectory())
+        .map((entry) => entry.name);
+    const records: CinematicSummary[] = [];
+    for (const project of projectDirs) {
+      const files = await readdir(path.join(this.cinematicsDir, project)).catch(() => []);
+      for (const file of files.filter((entry) => entry.endsWith('.json'))) {
+        const document = await this.readCinematicFile(project, path.basename(file, '.json')).catch(() => null);
+        if (!document) continue;
+        const currentMap = await this.loadMap(document.mapId).catch(() => null);
+        records.push(cinematicSummary(
+          document,
+          currentMap?.version ?? null,
+          currentMap ? this.mapFingerprint(currentMap) : null
+        ));
+      }
+    }
+    return records.sort((left, right) => right.updatedAt - left.updatedAt);
+  }
+
+  async loadCinematic(projectId: string, cinematicId: string): Promise<CinematicDocument> {
+    await this.ensureReady();
+    return this.readCinematicFile(projectId, cinematicId);
+  }
+
+  async saveCinematic(input: unknown, projectId?: string): Promise<CinematicDocument> {
+    await this.ensureReady();
+    const document = normalizeCinematic(input, projectId ? { projectId } : undefined);
+    const map = await this.loadMap(document.mapId).catch(() => null);
+    if (!map) throw new Error('unknown_cinematic_map');
+    if (document.directorPlan.mapId !== map.id) throw new Error('cinematic_plan_map_mismatch');
+    const existing = await this.readCinematicFile(document.projectId, document.id).catch(() => null);
+    const saved = normalizeCinematic({
+      ...document,
+      mapFingerprint: this.mapFingerprint(map),
+      createdAt: existing?.createdAt ?? document.createdAt,
+      updatedAt: Date.now()
+    });
+    await mkdir(this.cinematicProjectDir(saved.projectId), { recursive: true });
+    await atomicWriteJson(this.cinematicPath(saved.projectId, saved.id), saved);
+    return saved;
+  }
+
+  async deleteCinematic(projectId: string, cinematicId: string): Promise<void> {
+    await this.ensureReady();
+    await rm(this.cinematicPath(projectId, cinematicId), { force: true });
   }
 
   async deleteAsset(id: string): Promise<void> {
@@ -1044,6 +1106,26 @@ export class MapStore {
 
   private assetPath(id: string): string {
     return path.join(this.assetsDir, `${safeId(id)}.json`);
+  }
+
+  private cinematicProjectDir(projectId: string): string {
+    return path.join(this.cinematicsDir, safeId(projectId));
+  }
+
+  private cinematicPath(projectId: string, id: string): string {
+    return path.join(this.cinematicProjectDir(projectId), `${safeId(id)}.json`);
+  }
+
+  private async readCinematicFile(projectId: string, id: string): Promise<CinematicDocument> {
+    const text = await readFile(this.cinematicPath(projectId, id), 'utf8');
+    const document = normalizeCinematic(JSON.parse(text));
+    if (document.projectId !== safeId(projectId) || document.id !== safeId(id)) throw new Error('cinematic_path_mismatch');
+    return document;
+  }
+
+  private mapFingerprint(map: EditableMap): string {
+    const source = normalizeMap({ ...map, assets: undefined, collisionBake: undefined });
+    return createHash('sha256').update(JSON.stringify(source)).digest('hex');
   }
 
   private renderSchemePath(id: string): string {

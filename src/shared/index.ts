@@ -45,6 +45,9 @@ export * from './hdri';
 export * from './renderScheme';
 export * from './renderPlan';
 
+// Cutscene source documents and their director-plan bindings.
+export * from './cinematic';
+
 /**
  * Vector/angle helpers shared with the editor. Namespaced because names like
  * `add`, `scale` and `length` have no business sitting in a package's top level.

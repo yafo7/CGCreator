@@ -5,6 +5,7 @@ import path from 'node:path';
 import { createEmptyMap, createMapObject } from '../src/shared/map';
 import { BUILTIN_RENDER_SCHEMES } from '../src/shared/renderScheme';
 import { MapStore } from '../src/server/mapStore';
+import { createEmptyDirectorReferences } from '../src/shared/director';
 import {
   buildProjectExportPlan,
   inspectProjectExport,
@@ -68,6 +69,50 @@ describe('project directory export', () => {
       renderScheme: 'render-scheme.json',
       hdri: { file: 'hdri/forest.exr' }
     });
+  });
+
+  it('includes optional cutscene source documents in the map export', () => {
+    const map = createEmptyMap('街区');
+    const plan = buildProjectExportPlan({
+      map,
+      renderScheme: BUILTIN_RENDER_SCHEMES[0],
+      profile: profile(),
+      cinematics: [{
+        schemaVersion: 1,
+        kind: 'worldforge-cinematic',
+        id: 'cg-opening',
+        projectId: 'mandeya',
+        mapId: map.id,
+        mapVersion: map.version,
+        title: '开场',
+        status: 'draft',
+        sourcePrompt: '鸭子进入街区',
+        references: createEmptyDirectorReferences(),
+        bindings: { actors: [], props: [] },
+        directorPlan: {
+          schemaVersion: 1,
+          mapId: map.id,
+          title: '开场',
+          logline: '鸭子进入街区',
+          sourcePrompt: '鸭子进入街区',
+          sceneSummary: '',
+          estimatedDurationSeconds: 1,
+          cast: [],
+          shots: [{
+            id: 'shot-1', order: 1, title: '入口', purpose: '', location: '街区', durationSeconds: 1,
+            camera: { height: 'eye-level', framing: 'wide', movement: 'static', lensMm: 35, direction: '', subject: '' },
+            blocking: [], action: '', transition: 'cut', notes: []
+          }],
+          assumptions: [], referenceNeeds: []
+        },
+        compiledRuntime: null,
+        createdAt: 1,
+        updatedAt: 2
+      }]
+    });
+    expect(plan.files.map((file) => file.path)).toContain('maps/街区/cutscenes/cg-opening/cinematic.json');
+    const manifest = JSON.parse(text(plan.files.find((file) => file.path.endsWith('/manifest.json'))!.bytes));
+    expect(manifest.cinematics).toEqual(['cutscenes/cg-opening/cinematic.json']);
   });
 
   it('preflights every conflict before writing and never removes unrelated files', async () => {

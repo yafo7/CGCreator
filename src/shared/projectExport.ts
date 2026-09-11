@@ -36,6 +36,7 @@ export interface ProjectExportManifest {
   assetRoot: string;
   assetLibrary: string;
   assets: ProjectExportAssetReference[];
+  cinematics?: string[];
   hdri?: { file: string; sha256: string };
 }
 

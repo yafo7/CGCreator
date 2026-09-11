@@ -10,6 +10,7 @@ import {
   type ProjectExportProfile
 } from '../shared/projectExport';
 import type { RenderScheme } from '../shared/renderScheme';
+import type { CinematicDocument } from '../shared/cinematic';
 
 export interface ProjectExportFile {
   path: string;
@@ -35,6 +36,7 @@ export function buildProjectExportPlan(input: {
   profile: ProjectExportProfile;
   mapFolder?: string;
   hdri?: { file: string; bytes: Uint8Array };
+  cinematics?: CinematicDocument[];
 }): ProjectExportPlan {
   const mapFolder = normalizeProjectMapFolder(input.mapFolder, input.map.name);
   const mapRoot = path.posix.join(input.profile.mapsDirectory, mapFolder);
@@ -54,6 +56,10 @@ export function buildProjectExportPlan(input: {
     };
   });
   const exportedMap = { ...input.map, assets: exportedAssets };
+  const cinematicFiles = (input.cinematics ?? []).map((cinematic) => ({
+    path: path.posix.join(mapRoot, 'cutscenes', safeFileName(cinematic.id), 'cinematic.json'),
+    bytes: jsonBytes(cinematic)
+  }));
   const libraryFile = `libraries/${input.map.id}.json`;
   const library = {
     kind: 'worldforge-project-asset-library',
@@ -74,6 +80,9 @@ export function buildProjectExportPlan(input: {
     assetRoot: assetReferenceRoot,
     assetLibrary: path.posix.join(assetReferenceRoot, libraryFile),
     assets: assetReferences,
+    ...(cinematicFiles.length ? {
+      cinematics: cinematicFiles.map((file) => path.posix.relative(mapRoot, file.path))
+    } : {}),
     ...(input.hdri ? {
       hdri: { file: `hdri/${safeFileName(input.hdri.file)}`, sha256: hash(input.hdri.bytes) }
     } : {})
@@ -83,6 +92,7 @@ export function buildProjectExportPlan(input: {
     { path: path.posix.join(mapRoot, 'render-scheme.json'), bytes: jsonBytes(input.renderScheme) },
     { path: path.posix.join(mapRoot, 'manifest.json'), bytes: jsonBytes(manifest) },
     { path: path.posix.join(assetRoot, libraryFile), bytes: jsonBytes(library) },
+    ...cinematicFiles,
     ...modelFiles.values()
   ];
   if (input.hdri) {

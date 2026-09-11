@@ -9,6 +9,7 @@
       "default": "./dist-map-core/index.js"
     },
     "./viewer": "./src/client/mapViewer.ts",
+    "./host": "./src/client/mapHost.ts",
     "./vite": "./voxelStudioVite.mjs"
   },
   "scripts": {

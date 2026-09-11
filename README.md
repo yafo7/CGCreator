@@ -134,7 +134,7 @@ npm run server
 
 ## 数据
 
-默认数据目录为 `data/map-editor`，其中地图、资产与自定义渲染方案分开保存。可以通过 `WORLDFORGE_DATA_DIR` 指定其他目录。
+默认数据目录为 `data/map-editor`，其中地图、资产、自定义渲染方案与 CG 剧情文档分开保存。CG 位于 `cinematics/<projectId>/<cgId>.json`，引用地图版本、导演策划稿和空间参考，不复制地图或模型资产。可以通过 `WORLDFORGE_DATA_DIR` 指定其他目录。
 
 地图命令：
 
