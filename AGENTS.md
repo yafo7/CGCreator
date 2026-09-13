@@ -1,4 +1,10 @@
-# WorldForge Studio Agent Guide
+# CGCreator Agent Guide
+
+CGCreator extends WorldForge with an editable realtime cinematic compiler and workspace. The repository owner has authorized modifications to core source for this implementation. Retain the WorldForge editor and map protocol. CG-specific code lives in `src/shared/cg*`, `src/server/cg*`, and `src/client/cg*`.
+
+Director intent, compiled tracks, and confirmed playback are separate artifacts. Always enforce user constraints in code. AI patches cannot remove or rewrite manual constraints. Playback must evaluate an absolute time without accumulated motion; actor world movement has one owner, and animation clips are in-place. Keep a confirmed version available during failed or incomplete revisions. Do not claim unsupported actions succeeded.
+
+Project guidance is in `skills/cg-director/SKILL.md` and `skills/cg-camera-direction/SKILL.md`. These guide authoring; executable capability definitions and validation live in the TypeScript compiler. Run all tests, build, and visible browser verification before delivery.
 
 ## Scope
 

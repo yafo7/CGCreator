@@ -8,7 +8,7 @@ const styles = readFileSync(new URL('../src/styles.css', import.meta.url), 'utf8
 describe('director editor UI', () => {
   it('offers CG as a third workspace backed by the current map', () => {
     expect(editor).toContain("type EditorStage = 'map' | 'render' | 'director'");
-    expect(editor).toContain('<button data-stage="director">CG</button>');
+    expect(editor.match(/<button data-stage="director"[^>]*>([^<]+)<\/button>/)?.[1]).toBe('CG 导演');
     expect(editor).toContain('id="director-inspector"');
   });
 

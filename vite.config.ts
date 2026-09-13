@@ -10,7 +10,8 @@ export default defineConfig(({ command }) => ({
     exclude: ['@voxel-studio/render-runtime']
   },
   server: {
-    port: 5180,
+    port: 5182,
+    strictPort: true,
     headers: {
       'Cache-Control': 'no-store'
     }

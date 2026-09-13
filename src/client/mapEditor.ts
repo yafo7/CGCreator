@@ -340,6 +340,7 @@ class MapEditor {
   private readonly adaptiveQuality = new AdaptiveRenderQuality();
   private renderQualityMode: RenderQualityMode = 'auto';
   private playMode: PlayModeController | null = null;
+  private cgWorkspaceOpen = false;
   private hdriFiles: string[] = [];
   private hdriTextures: HdriTexture[] = [];
   private orbit: OrbitControls | null = null;
@@ -522,8 +523,8 @@ class MapEditor {
       <main class="editor-shell">
         <aside class="editor-sidebar left">
           <div class="studio-brand">
-            <span class="studio-brand-mark">W</span>
-            <span><strong>WorldForge</strong><small>SCENE STUDIO</small></span>
+            <span class="studio-brand-mark">C</span>
+            <span><strong>CGCreator</strong><small>WORLD · DIRECT · PLAY</small></span>
           </div>
           <button id="toggle-hierarchy" class="hierarchy-toggle secondary" type="button" aria-expanded="false" title="展开层级">
             <span>层级</span>
@@ -590,7 +591,7 @@ class MapEditor {
             <div class="stage-switcher segmented compact toolbar-workspace" aria-label="制作阶段">
               <button data-stage="map">地图</button>
               <button data-stage="render">渲染</button>
-              <button data-stage="director">CG</button>
+              <button data-stage="director" title="用当前地图制作可编辑的实时 3D 演出">CG 导演</button>
             </div>
             <div class="toolbar-group toolbar-tools" data-map-only>
               <span class="toolbar-label">工具</span>
@@ -5956,6 +5957,10 @@ class MapEditor {
       this.updateToolbarState();
       return;
     }
+    if (stage === 'director') {
+      void this.openCgCreator();
+      return;
+    }
     if (stage === 'render' && !this.state.map?.confirmedAt) {
       this.state.message = '请先确认地图，再进入渲染阶段';
       this.updateToolbarState();
@@ -5974,6 +5979,41 @@ class MapEditor {
     if (stage === 'render') this.resetRenderDraft();
     this.applyCurrentRenderScheme();
     this.renderPanels();
+  }
+
+  private async openCgCreator(): Promise<void> {
+    if (this.cgWorkspaceOpen || !this.state.map) return;
+    if (this.state.busy) {
+      this.state.message = '请等待当前地图操作完成，再打开 CG 导演';
+      this.updateToolbarState();
+      return;
+    }
+    // Capture the same map/assets and render scheme that are currently visible.
+    const map = structuredClone(this.mapWithEditorAssets());
+    const scheme = structuredClone(this.visibleRenderScheme());
+    this.cgWorkspaceOpen = true;
+    this.playMode?.exit();
+    this.cancelAssetPlacement();
+    this.cameraKeys.clear();
+    this.painting = false;
+    this.transform?.detach();
+    if (this.orbit) this.orbit.enabled = false;
+    this.app.inert = true;
+    const restore = () => {
+      this.cgWorkspaceOpen = false;
+      this.app.inert = false;
+      if (this.orbit) this.orbit.enabled = true;
+      this.lastFrameAt = performance.now();
+      this.resize();
+    };
+    try {
+      const { openCgWorkspace } = await import('./cgWorkspace');
+      await openCgWorkspace({ map, scheme, onClose: restore });
+    } catch (error) {
+      restore();
+      this.state.message = `CGCreator 打开失败：${error instanceof Error ? error.message : String(error)}`;
+      this.updateToolbarState();
+    }
   }
 
   private async beginAssetPlacement(): Promise<void> {
@@ -6601,12 +6641,15 @@ class MapEditor {
   }
 
   private applyCurrentRenderScheme(): void {
-    const scheme = !this.mapAiPreviewMap && this.state.map?.confirmedAt
+    this.renderScene?.applyScheme(this.visibleRenderScheme());
+  }
+
+  private visibleRenderScheme(): RenderScheme | null {
+    return !this.mapAiPreviewMap && this.state.map?.confirmedAt
       ? this.renderAiPreview && !this.renderAiPreviewVisible
         ? this.renderAiComparisonScheme ?? this.selectedRenderScheme()
         : this.renderDraft ?? this.selectedRenderScheme()
       : null;
-    this.renderScene?.applyScheme(scheme);
   }
 
   private renderDebugDetails(): RenderDebugDetails {
@@ -6646,6 +6689,7 @@ class MapEditor {
 
   private animate(): void {
     this.animationFrame = requestAnimationFrame(() => this.animate());
+    if (this.cgWorkspaceOpen) return;
     const now = performance.now();
     const frameMs = Math.max(0, now - this.lastFrameAt);
     const dt = Math.min(0.05, frameMs / 1000);
@@ -7144,6 +7188,7 @@ class MapEditor {
   }
 
   private handleKeyDown = (event: KeyboardEvent): void => {
+    if (this.cgWorkspaceOpen) return;
     if (this.playMode?.isActive) return;
     if (isEditableTarget(event.target)) return;
     if ((event.ctrlKey || event.metaKey) && event.code === 'KeyZ') {
@@ -7198,6 +7243,7 @@ class MapEditor {
   };
 
   private handleKeyUp = (event: KeyboardEvent): void => {
+    if (this.cgWorkspaceOpen) return;
     if (!CAMERA_MOVE_KEYS.has(event.code)) return;
     this.cameraKeys.delete(event.code);
     event.preventDefault();

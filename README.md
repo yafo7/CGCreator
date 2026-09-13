@@ -1,4 +1,20 @@
-# WorldForge Studio
+# CGCreator
+
+基于 WorldForge 的实时 3D 导演工作台。自然语言先生成高层 `DirectorDocument`，再解析世界与资源、编译成确定时间轴，经过校验、预览和用户确认后保存可播放版本。输出是结构化场景和演出数据。
+
+## CGCreator V1
+
+- 保留 WorldForge 地图生成、编辑、导入与渲染工作流。点击顶部 **CG 导演**，从当前可见地图和渲染方案创建独立快照。
+- 输入剧情生成导演文档；**离线演示**使用明确标记的内置角色和动画，便于在不调用模型服务时体验完整流程。
+- 编译并校验后播放、暂停、拖动时间轴，选择镜头进行“慢一点”“改成特写”等局部修改。
+- 在场景标点锁定角色/道具位置、行动终点，或手动摆好摄像机后锁定机位；数值时间约束与其他人工约束由编译器强制执行。
+- 修改只产生草稿，原确认版本保留；只有当前候选版本通过校验，才能确认和导出可播放 JSON。项目可再次打开。
+
+首次运行：`npm ci`，然后 `npm run dev`。打开 **http://localhost:5182**，API 为 **http://127.0.0.1:8799**。生产模式：`npm run build` 后 `npm run server`，打开 **http://127.0.0.1:8799**。
+
+架构、协议与第一版边界见 [CGCreator 架构](docs/cgcreator-architecture.md)。参考 skill 和库的选用记录见 [来源说明](docs/cgcreator-sources.md)。下文保留 WorldForge 底座的功能说明。
+
+## WorldForge 底座
 
 WorldForge Studio 是一个独立的 AI 辅助 Three.js 场景编辑器，用于创建、编辑和预览可持续迭代的室内外场景。它结合地形、参数化房间、资产编辑、受约束的 AI 构图与可复用渲染方案；生成结果始终保留为可预览、可编辑、可撤销的地图事务。
 
@@ -65,7 +81,7 @@ npm install
 npm run dev
 ```
 
-浏览器打开 `http://localhost:5180`。本地编辑 API 默认运行在 `http://localhost:8797`。
+浏览器打开 `http://localhost:5182`。CGCreator 本地编辑 API 默认运行在 `http://localhost:8799`。
 
 渲染 Runtime 已作为固定快照随本仓库发布，并与本仓库的同一份 `three` 一起安装，避免出现两个 Three.js 实例导致的材质、后处理异常。首次启动空白数据目录时，会自动导入九张金样地图及其引用资产、渲染方案；已有 `data/map-editor` 不会被覆盖。
 
@@ -130,7 +146,7 @@ npm run build
 npm run server
 ```
 
-此时打开 `http://127.0.0.1:8797`。
+此时打开 `http://127.0.0.1:8799`。
 
 ## 数据
 

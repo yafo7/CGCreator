@@ -1,6 +1,7 @@
 import http from 'node:http';
 import path from 'node:path';
 import { handleMapHttp } from './mapHttp';
+import { handleCgHttp } from './cgHttp';
 import { MapStore } from './mapStore';
 import { handleStaticClient } from './staticClient';
 import { WORLD_FORGE_DEV_API_PORT } from '../shared/network';
@@ -15,10 +16,11 @@ await store.ensureReady();
 const server = http.createServer(async (req, res) => {
   try {
     if (req.method === 'GET' && req.url === '/api/health') {
-      sendJson(res, 200, { ok: true, app: 'worldforge-studio' });
+      sendJson(res, 200, { ok: true, app: 'cgcreator', version: '0.1.0' });
       return;
     }
 
+    if (await handleCgHttp(req, res, store)) return;
     if (await handleMapHttp(req, res, store)) return;
     if (!development && await handleStaticClient(req, res, path.resolve(process.cwd(), 'dist'))) return;
     sendJson(res, 404, { error: 'not_found' });
@@ -35,8 +37,8 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.listen(port, host, () => {
-  const client = development ? 'http://localhost:5180' : `http://${host}:${port}`;
-  console.log(`WorldForge Studio: ${client}`);
+  const client = development ? 'http://localhost:5182' : `http://${host}:${port}`;
+  console.log(`CGCreator: ${client}`);
   console.log(`Local API: http://${host}:${port}`);
 });
 
