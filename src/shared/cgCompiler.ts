@@ -4,10 +4,11 @@ import { applyMapOperations } from './mapOperations';
 import type { RenderScheme } from './renderScheme';
 import type { CgAction, CgAnchor, CgCameraPose, CgCompiledAction, CgCompiledShot, CgConstraint, CgEntityState, CgFrame, CgPatchOperation, CgQuat, CgResources, CgVec3, CompiledCG, DirectorDocument } from './cgTypes';
 import { assertDirector, stableHash, validateDirectorDocument } from './cgValidation';
-import { distance, findGroundPath, freeGroundPoint, mix, samplePath } from './cgPath';
+import { distance, findGroundPath, freeGroundPoint, samplePath } from './cgPath';
+import { calculateModelSemanticLandmarks } from './modelBounds';
 
 export { stableHash, validateDirectorDocument } from './cgValidation';
-export const CG_COMPILER_VERSION = 'cgcreator-1.0.0';
+export const CG_COMPILER_VERSION = 'cgcreator-1.2.0';
 const clone = <T>(value: T): T => structuredClone(value);
 const clamp01 = (n: number) => Math.min(1, Math.max(0, n));
 const quat = (rotation: CgVec3): CgQuat => new Quaternion().setFromEuler(new Euler(...rotation)).toArray() as CgQuat;
@@ -103,7 +104,8 @@ export function compileDirector(document: DirectorDocument, map: EditableMap, sc
     // Existing map objects retain their authored world scale (including size).
     if (!transform && entity.height !== undefined) scale.fill(entity.height / modelHeight);
     const height = Math.max(0.1, modelHeight * Math.abs(scale[1]));
-    bundle.bindings.push({ entityId: entity.id, objectId: object.id, assetId, height });
+    const focus = asset ? calculateModelSemanticLandmarks(asset.modelJson) : undefined;
+    bundle.bindings.push({ entityId: entity.id, objectId: object.id, assetId, height, focus });
     bundle.initial[entity.id] = { position, quaternion: transform ? quat(transform.rotation) : [0, 0, 0, 1], scale, visible: object.visible };
     // CG owns every animated root. Flatten bound roots in this derived snapshot so the
     // map renderer cannot accidentally apply a moving parent transform a second time.
@@ -128,7 +130,7 @@ export function compileDirector(document: DirectorDocument, map: EditableMap, sc
     const lockedDuration = single(constraints('shot-duration', shot.id), (c) => c.seconds);
     const duration = lockedDuration?.seconds ?? shot.duration;
     const hard = positionConstraint('camera-pose', shot.id), anchor = hard ? anchors.get(hard.anchorId!) : undefined;
-    const compiled: CgCompiledShot = { id: shot.id, start: shotStart, end: shotStart + duration, camera: clone(shot.camera), inputHash: '' };
+    const compiled: CgCompiledShot = { id: shot.id, start: shotStart, end: shotStart + duration, camera: clone(shot.camera), transition: clone(shot.transition), inputHash: '' };
     if (anchor?.quaternion) compiled.lockedPose = { position: [...anchor.position], quaternion: [...anchor.quaternion], fov: anchor.fov ?? 45 };
     bundle.shots.push(compiled); shotStart += duration;
     bundle.dependencies[shot.id] = [shot.camera.subjectId, ...(shot.camera.secondaryId ? [shot.camera.secondaryId] : []), ...(hard ? [hard.id, hard.anchorId!] : []), ...(lockedDuration ? [lockedDuration.id] : [])];
@@ -227,14 +229,19 @@ export function compileDirector(document: DirectorDocument, map: EditableMap, sc
     if (!shot.lockedPose) {
       const original = clone(shot.camera);
       let best = original, bestScore = -Infinity;
-      for (const offset of [0, Math.PI / 4, -Math.PI / 4, Math.PI / 2, -Math.PI / 2, Math.PI, Math.PI * 3 / 4, -Math.PI * 3 / 4]) {
-        shot.camera = { ...original, azimuth: (original.azimuth ?? Math.PI / 5) + offset };
+      const relative = original.reference && original.reference !== 'world';
+      const offsets = relative
+        ? [0, Math.PI / 12, -Math.PI / 12, Math.PI / 6, -Math.PI / 6]
+        : [0, Math.PI / 4, -Math.PI / 4, Math.PI / 2, -Math.PI / 2, Math.PI, Math.PI * 3 / 4, -Math.PI * 3 / 4];
+      for (const offset of offsets) {
+        shot.camera = { ...original, azimuth: (original.azimuth ?? (relative ? 0 : Math.PI / 5)) + offset };
         const score = cameraScore(bundle, shot, boxes);
         if (score > bestScore) { best = clone(shot.camera); bestScore = score; }
         if (score === 3) break;
       }
       shot.camera = best;
       if (bestScore < 3) diagnostic('camera_obstructed', 'Automatic camera could not keep a clear view throughout this shot; adjust staging or set an exact camera pose.', [shot.id]);
+      if (shot.camera.framing === 'close-up' && shot.camera.aim && bundle.bindings.find((binding) => binding.entityId === shot.camera.subjectId)?.focus?.source === 'proportional-fallback') diagnostic('face_landmark_fallback', 'Close-up uses proportional face placement because the model has no named head/face hierarchy.', [shot.id, shot.camera.subjectId], 'warning');
     } else if (cameraScore(bundle, shot, boxes, true) < 3) diagnostic('locked_camera_collision', 'The exact camera pose intersects the terrain or map geometry.', [shot.id]);
     // Future actions cannot change the evaluated state in this shot. Excluding
     // them keeps an edit to a later beat from invalidating earlier cameras.
@@ -242,6 +249,7 @@ export function compileDirector(document: DirectorDocument, map: EditableMap, sc
     bundle.dependencies[shot.id].push(...deps.map((a) => a.id));
     shot.inputHash = stableHash({ shot: { ...shot, inputHash: undefined }, subjects: [bundle.initial[shot.camera.subjectId], shot.camera.secondaryId ? bundle.initial[shot.camera.secondaryId] : undefined], bindings: bundle.bindings.filter((b) => [shot.camera.subjectId, shot.camera.secondaryId].includes(b.entityId)), actions: deps.map((a) => a.inputHash), world: boxes, terrain: bundle.map.terrain });
   }
+  validateShotContinuity(bundle, diagnostic);
   return finish();
 }
 
@@ -270,6 +278,65 @@ function lookAt(position: CgVec3, target: CgVec3, fov: number): CgCameraPose {
   return { position, quaternion: new Quaternion().setFromRotationMatrix(matrix).toArray() as CgQuat, fov, target };
 }
 
+function semanticTarget(bundle: CompiledCG, entityId: string, state: CgEntityState, aim: CgCompiledShot['camera']['aim']): CgVec3 {
+  const binding = bundle.bindings.find((candidate) => candidate.entityId === entityId);
+  const height = binding?.height ?? 1.8;
+  const localHeight = height / Math.max(1e-6, Math.abs(state.scale[1]));
+  const fallback: Record<string, CgVec3> = {
+    body: [0, localHeight * 0.5, 0], 'upper-body': [0, localHeight * 0.7, 0], face: [0, localHeight * 0.84, 0], eyes: [0, localHeight * 0.89, 0]
+  };
+  const local = binding?.focus?.[aim === 'upper-body' ? 'upperBody' : aim === 'face' || aim === 'eyes' ? aim : 'body'] ?? fallback[aim ?? 'body'];
+  const transformed = new Vector3(...local)
+    .multiply(new Vector3(...state.scale))
+    .applyQuaternion(new Quaternion().fromArray(state.quaternion))
+    .add(new Vector3(...state.position));
+  return transformed.toArray() as CgVec3;
+}
+
+function horizontalFrame(intent: CgCompiledShot['camera'], subject: CgEntityState, secondary?: CgEntityState) {
+  const facing = new Vector3(0, 0, 1).applyQuaternion(new Quaternion().fromArray(subject.quaternion));
+  facing.y = 0;
+  if (facing.lengthSq() < 1e-8) facing.set(0, 0, 1); else facing.normalize();
+  let forward = facing;
+  if (intent.reference === 'interaction-axis' && secondary) {
+    forward = new Vector3(...secondary.position).sub(new Vector3(...subject.position));
+    forward.y = 0;
+    if (forward.lengthSq() < 1e-8) forward = facing; else forward.normalize();
+  }
+  const right = new Vector3(forward.z, 0, -forward.x).normalize();
+  return { forward, right };
+}
+
+function semanticOffset(intent: CgCompiledShot['camera'], forward: Vector3, right: Vector3): Vector3 {
+  const side = right.clone().multiplyScalar(intent.side === 'left' ? -1 : 1);
+  let offset: Vector3;
+  switch (intent.view) {
+    case 'front': offset = forward.clone(); break;
+    case 'front-three-quarter': offset = forward.clone().add(side).normalize(); break;
+    case 'side': offset = side; break;
+    case 'rear-three-quarter': offset = forward.clone().multiplyScalar(-1).add(side).normalize(); break;
+    case 'rear': offset = forward.clone().multiplyScalar(-1); break;
+    default: offset = forward.clone().applyAxisAngle(new Vector3(0, 1, 0), intent.side === 'left' ? -(intent.azimuth ?? Math.PI / 5) : (intent.azimuth ?? Math.PI / 5)); return offset;
+  }
+  return offset.applyAxisAngle(new Vector3(0, 1, 0), intent.azimuth ?? 0).normalize();
+}
+
+function composedLookAt(position: CgVec3, focus: CgVec3, fov: number, screenPosition?: [number, number]): CgCameraPose {
+  if (!screenPosition || (Math.abs(screenPosition[0]) < 1e-8 && Math.abs(screenPosition[1]) < 1e-8)) return lookAt(position, focus, fov);
+  const camera = new Vector3(...position), subject = new Vector3(...focus);
+  const forward = subject.clone().sub(camera).normalize();
+  const right = new Vector3().crossVectors(forward, new Vector3(0, 1, 0)).normalize();
+  const up = new Vector3().crossVectors(right, forward).normalize();
+  const range = camera.distanceTo(subject);
+  const vertical = 2 * range * Math.tan(fov * Math.PI / 360);
+  const lookTarget = subject.clone()
+    .addScaledVector(right, -screenPosition[0] * vertical * 16 / 9)
+    .addScaledVector(up, -screenPosition[1] * vertical);
+  const pose = lookAt(position, lookTarget.toArray() as CgVec3, fov);
+  pose.target = [...focus];
+  return pose;
+}
+
 function sampleCamera(bundle: CompiledCG, shot: CgCompiledShot, time: number, current?: Record<string, CgEntityState>): CgCameraPose {
   if (shot.lockedPose) return clone(shot.lockedPose);
   const intent = shot.camera, start = sampleEntities(bundle, shot.start);
@@ -278,10 +345,19 @@ function sampleCamera(bundle: CompiledCG, shot: CgCompiledShot, time: number, cu
   const subject = subjects[intent.subjectId];
   const height = bundle.bindings.find((b) => b.entityId === intent.subjectId)?.height ?? 1.8;
   if (!subject) return lookAt([0, 3, 6], [0, 0, 0], 45);
-  const target: CgVec3 = [subject.position[0], subject.position[1] + height * (intent.framing === 'close-up' ? 0.85 : 0.65), subject.position[2]];
-  const fov = 2 * Math.atan(24 / (2 * (intent.lensMm ?? (intent.framing === 'close-up' ? 70 : 40)))) * 180 / Math.PI;
-  const extent = height * (intent.framing === 'wide' ? 1.8 : intent.framing === 'close-up' ? 0.33 : 0.85);
+  const aim = intent.aim ?? (intent.framing === 'close-up' ? 'face' : intent.framing === 'medium' || intent.framing === 'over-shoulder' ? 'upper-body' : 'body');
+  const secondary = intent.secondaryId ? subjects[intent.secondaryId] : undefined;
+  let target = semanticTarget(bundle, intent.subjectId, subject, aim);
+  if (aim === 'interaction' && secondary && intent.secondaryId) {
+    const other = semanticTarget(bundle, intent.secondaryId, secondary, 'upper-body');
+    target = [(target[0] + other[0]) / 2, (target[1] + other[1]) / 2, (target[2] + other[2]) / 2];
+  }
+  const fov = 2 * Math.atan(24 / (2 * (intent.lensMm ?? (intent.framing === 'close-up' ? 85 : 40)))) * 180 / Math.PI;
+  const binding = bundle.bindings.find((candidate) => candidate.entityId === intent.subjectId);
+  const scaledFaceHeight = (binding?.focus?.faceHeight ?? height * 0.22) * Math.abs(subject.scale[1]);
+  const extent = intent.framing === 'wide' ? height * 1.8 : intent.framing === 'close-up' ? Math.max(scaledFaceHeight * 2.2, height * 0.45) : height * 0.85;
   let range = intent.distance ?? extent / (2 * Math.tan(fov * Math.PI / 360));
+  const composition = intent.screenPosition ?? (aim === 'eyes' ? [0, 0.08] as [number, number] : undefined);
   const t = clamp01((time - shot.start) / (shot.end - shot.start));
   if (intent.movement === 'dolly') range *= 1.25 - 0.45 * t;
   let angle = (intent.azimuth ?? Math.PI / 5) + (intent.movement === 'orbit' ? (t - 0.5) * Math.PI / 2 : 0);
@@ -292,11 +368,18 @@ function sampleCamera(bundle: CompiledCG, shot: CgCompiledShot, time: number, cu
       const length = Math.hypot(dx, dz) || 1;
       const ux = dx / length, uz = dz / length, side = intent.side === 'left' ? -1 : 1;
       const shoulderHeight = bundle.bindings.find((b) => b.entityId === intent.secondaryId)?.height ?? height;
-      return lookAt([secondary.position[0] + ux * range * 0.35 + uz * side * shoulderHeight * 0.35, secondary.position[1] + (intent.height ?? shoulderHeight * 0.87), secondary.position[2] + uz * range * 0.35 - ux * side * shoulderHeight * 0.35], target, fov);
+      return composedLookAt([secondary.position[0] + ux * range * 0.35 + uz * side * shoulderHeight * 0.35, secondary.position[1] + (intent.height ?? shoulderHeight * 0.87), secondary.position[2] + uz * range * 0.35 - ux * side * shoulderHeight * 0.35], target, fov, composition);
     }
   }
+  if (intent.reference && intent.reference !== 'world') {
+    const frame = horizontalFrame(intent, subject, secondary);
+    const offset = semanticOffset(intent, frame.forward, frame.right);
+    if (intent.movement === 'orbit') offset.applyAxisAngle(new Vector3(0, 1, 0), (t - 0.5) * Math.PI / 2);
+    const y = intent.height !== undefined ? subject.position[1] + intent.height : target[1] + (intent.framing === 'wide' ? height * 0.16 : intent.framing === 'close-up' ? 0 : height * 0.08);
+    return composedLookAt([target[0] + offset.x * range, y, target[2] + offset.z * range], target, fov, composition);
+  }
   if (intent.side === 'left') angle = -angle;
-  return lookAt([target[0] + Math.sin(angle) * range, subject.position[1] + (intent.height ?? height * 0.92), target[2] + Math.cos(angle) * range], target, fov);
+  return composedLookAt([target[0] + Math.sin(angle) * range, subject.position[1] + (intent.height ?? height * 0.92), target[2] + Math.cos(angle) * range], target, fov, composition);
 }
 
 function lineIntersectsBox(a: CgVec3, b: CgVec3, box: MapObjectAabb, padding = 0): boolean {
@@ -328,11 +411,72 @@ function cameraScore(bundle: CompiledCG, shot: CgCompiledShot, boxes: MapObjectA
   return score / count * 3;
 }
 
+function validateShotContinuity(bundle: CompiledCG, diagnostic: (code: string, message: string, nodeIds?: string[], severity?: 'error' | 'warning') => void) {
+  for (const shot of bundle.shots) {
+    if (shot.camera.framing === 'close-up' && shot.camera.lensMm !== undefined && shot.camera.lensMm < 50) {
+      diagnostic('close_up_wide_lens', 'Close-up lens is below 50mm and may distort the face; use 70–100mm unless distortion is intentional.', [shot.id], 'warning');
+    }
+  }
+  for (let index = 1; index < bundle.shots.length; index++) {
+    const previous = bundle.shots[index - 1], current = bundle.shots[index];
+    if (previous.camera.subjectId !== current.camera.subjectId) continue;
+    const boundary = current.start;
+    const subject = sampleEntities(bundle, boundary)[current.camera.subjectId];
+    if (!subject) continue;
+    const beforePose = sampleCamera(bundle, previous, Math.max(previous.start, previous.end - 1e-4));
+    const afterPose = sampleCamera(bundle, current, current.start);
+    const origin = new Vector3(...subject.position);
+    const before = new Vector3(...beforePose.position).sub(origin).setY(0);
+    const after = new Vector3(...afterPose.position).sub(origin).setY(0);
+    if (before.lengthSq() > 1e-8 && after.lengthSq() > 1e-8) {
+      const angle = before.angleTo(after) * 180 / Math.PI;
+      if (angle < 30 && previous.camera.framing === current.camera.framing && current.transition?.type !== 'ease-in-out') {
+        diagnostic('jump_cut_risk', `Adjacent same-size shots change the camera axis by only ${angle.toFixed(1)}°; change size or cross at least 30° for a clean cut.`, [previous.id, current.id], 'warning');
+      }
+    }
+    if (current.transition?.motivation === 'reestablish') continue;
+    const delta = Math.min(0.12, previous.end - previous.start, current.end - current.start);
+    const earlier = sampleEntities(bundle, Math.max(0, boundary - delta))[current.camera.subjectId];
+    const atCut = sampleEntities(bundle, boundary)[current.camera.subjectId];
+    const later = sampleEntities(bundle, Math.min(bundle.duration, boundary + delta))[current.camera.subjectId];
+    if (!earlier || !atCut || !later) continue;
+    const inbound = new Vector3(...atCut.position).sub(new Vector3(...earlier.position)).setY(0);
+    const outbound = new Vector3(...later.position).sub(new Vector3(...atCut.position)).setY(0);
+    if (inbound.lengthSq() < 1e-6 || outbound.lengthSq() < 1e-6) continue;
+    const motion = inbound.add(outbound).normalize();
+    const screenSign = (pose: CgCameraPose) => {
+      const view = new Vector3(...(pose.target ?? subject.position)).sub(new Vector3(...pose.position)).normalize();
+      const right = new Vector3().crossVectors(view, new Vector3(0, 1, 0)).normalize();
+      return Math.sign(motion.dot(right));
+    };
+    const beforeSign = screenSign(beforePose), afterSign = screenSign(afterPose);
+    if (beforeSign && afterSign && beforeSign !== afterSign) {
+      diagnostic('screen_direction_flip', 'Travel reverses screen direction across this cut. Show the turn or use a re-establishing transition.', [previous.id, current.id], 'warning');
+    }
+  }
+}
+
 export function evaluateCG(bundle: CompiledCG, time: number): CgFrame {
   const t = Math.max(0, Math.min(bundle.duration, Number.isFinite(time) ? time : 0));
   const entities = sampleEntities(bundle, t);
   const shot = bundle.shots.find((s) => t >= s.start && t < s.end) ?? bundle.shots[bundle.shots.length - 1];
-  const camera = shot ? sampleCamera(bundle, shot, t, entities) : lookAt([0, 3, 6], [0, 0, 0], 45);
+  let camera = shot ? sampleCamera(bundle, shot, t, entities) : lookAt([0, 3, 6], [0, 0, 0], 45);
+  if (shot?.transition?.type === 'ease-in-out' && shot.transition.duration && t < shot.start + shot.transition.duration) {
+    const index = bundle.shots.indexOf(shot);
+    const previous = index > 0 ? bundle.shots[index - 1] : undefined;
+    if (previous) {
+      const from = sampleCamera(bundle, previous, Math.max(previous.start, previous.end - 1e-6));
+      const raw = clamp01((t - shot.start) / shot.transition.duration);
+      const weight = raw * raw * (3 - 2 * raw);
+      const target = from.target && camera.target ? new Vector3(...from.target).lerp(new Vector3(...camera.target), weight).toArray() as CgVec3 : camera.target;
+      camera = {
+        position: new Vector3(...from.position).lerp(new Vector3(...camera.position), weight).toArray() as CgVec3,
+        quaternion: new Quaternion().fromArray(from.quaternion).slerp(new Quaternion().fromArray(camera.quaternion), weight).toArray() as CgQuat,
+        fov: from.fov + (camera.fov - from.fov) * weight,
+        target
+      };
+    }
+  }
   const effects: CgFrame['effects'] = [];
   for (const a of bundle.actions) if (a.type === 'effect' && t >= a.start && t < a.end) {
     // Event location is fixed at its start; a backward seek recreates identical particles.

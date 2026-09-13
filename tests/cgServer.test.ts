@@ -143,7 +143,7 @@ describe('CG planning, refine and resource resolution', () => {
     const chat = vi.fn(async () => { throw new Error('No remote call expected'); });
     const { service, project } = await demo(new CgService(new CgStore(root), { chat }));
     const refined = await service.refine(project.id, project.revision, '这个镜头改成特写', 'demo_shot_push');
-    expect(refined.operations).toEqual([{ type: 'shot.update', id: 'demo_shot_push', patch: { camera: { framing: 'close-up' } } }]);
+    expect(refined.operations).toEqual([{ type: 'shot.update', id: 'demo_shot_push', patch: { camera: { framing: 'close-up', movement: 'static', reference: 'subject-facing', view: 'front-three-quarter', aim: 'eyes', lensMm: 85 } } }]);
     expect(refined.project.document.actions).toEqual(project.document.actions);
     const compiled = await service.compile(project.id, refined.project.revision);
     expect(compiled.candidate!.actions.map((a) => a.inputHash)).toEqual(project.candidate!.actions.map((a) => a.inputHash));
@@ -181,6 +181,8 @@ describe('CG planning, refine and resource resolution', () => {
     let project = await service.create(mapFixture(), null);
     project = await service.plan(project.id, project.revision, 'A visitor walks and waves.');
     const context = JSON.parse(chat.mock.calls[0][0][1].content);
+    expect(chat.mock.calls[0][0][0].content).toContain('subject-motion');
+    expect(chat.mock.calls[0][0][0].content).toContain('30 degrees');
     expect(context.map).toMatchObject({ axis: 'Y-up', units: 'metres', id: 'film-stage' });
     expect(context.map.anchors).toEqual(buildSemanticContext(mapFixture()).anchors);
     project = await service.compile(project.id, project.revision);

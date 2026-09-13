@@ -10,6 +10,8 @@
 | [camera-controls](https://github.com/yomotsu/camera-controls) | 可交互机位编辑能力 | 本版沿用 WorldForge 已有 OrbitControls，保留后续替换空间 |
 | [CinemaTraj](https://github.com/Pangolin112/CinemaTraj) | 参数化轨迹与 `evaluate(t)`，区分自由参数和固定参数 | 确定性采样与人工约束的概念参考；未引入 Python/CUDA/3DGS 栈 |
 | [Theatre.js](https://github.com/theatre-js/theatre) | 可视化时间轴与编辑模型 | 本版使用轻量原生时间轴；后续接入前单独核对 Core 与 Studio 的授权边界 |
+| [everything-ai-filmmaking](https://github.com/PitchySentinel/everything-ai-filmmaking) | cinematography、shot-sequencing、continuity-checking：叙事意图到景别/角度、30 度规则、视线与运动方向、动机剪辑 | 提炼为原创 camera grammar，进入规划提示词、编译器诊断与项目 skill；不复制原文 |
+| [Unity Cinemachine documentation](https://docs.unity3d.com/Packages/com.unity.cinemachine@3.1/manual/CinemachineThirdPersonFollow.html) | 主体相对跟随、构图旋转、镜头质量评估的运行时机制 | 在 Three.js 编译器内实现主体坐标系、语义注视点与确定性遮挡评分；不引入 Unity 包 |
 
 授权处理：Threejs-Awesome-Graphics-Agent-Skills 的仓库根许可与部分包/依赖许可范围并不完全一致，因此不把“根目录 MIT”当作所有文件均可直接商用的证明。CutsceneProvider 与 cutscene_agent 研究时为 MIT；CinemaTraj 的第三方资产、模型与依赖仍需独立核对。本项目保留 WorldForge 原有授权与 vendor 声明，新增 skill 是本项目原创说明。
 

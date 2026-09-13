@@ -55,18 +55,34 @@ export function validateDirectorDocument(value: unknown): CgValidation {
     if (a.fov !== undefined && (!finite(a.fov) || a.fov <= 1 || a.fov >= 160)) error('Camera FOV must be between 1 and 160 degrees.', a.id);
   }
   for (const s of d.shots) {
-    keys(s, ['id', 'name', 'purpose', 'duration', 'camera', 'subtitle'], 'shot');
+    keys(s, ['id', 'name', 'purpose', 'duration', 'camera', 'transition', 'subtitle'], 'shot');
     if (typeof s.name !== 'string' || typeof s.purpose !== 'string' || !finite(s.duration) || s.duration <= 0 || s.duration > 300) error('Shot requires name/purpose and duration in (0,300].', s.id);
     if (!record(s.camera)) { error('Shot requires a camera intent.', s.id); continue; }
     const c = s.camera;
-    keys(c, ['movement', 'framing', 'subjectId', 'secondaryId', 'side', 'lensMm', 'distance', 'height', 'azimuth'], 'camera');
+    keys(c, ['movement', 'framing', 'subjectId', 'secondaryId', 'side', 'lensMm', 'distance', 'height', 'azimuth', 'reference', 'view', 'aim', 'screenPosition'], 'camera');
     if (!one(c.movement, ['static', 'dolly', 'tracking', 'orbit']) || !one(c.framing, ['wide', 'medium', 'close-up', 'over-shoulder'])) error('Unsupported camera movement or framing.', s.id, 'unsupported_camera');
     if (!entities.has(c.subjectId) || (c.secondaryId !== undefined && !entities.has(c.secondaryId))) error('Camera references an unknown entity.', s.id, 'missing_reference');
     if (c.framing === 'over-shoulder' && (!c.secondaryId || c.secondaryId === c.subjectId)) error('Over-shoulder needs two distinct entity IDs.', s.id);
     if (c.side !== undefined && !one(c.side, ['left', 'right'])) error('Camera side must be left or right.', s.id);
+    if (c.reference !== undefined && !one(c.reference, ['world', 'subject-facing', 'subject-motion', 'interaction-axis'])) error('Camera reference frame is invalid.', s.id);
+    if (c.view !== undefined && !one(c.view, ['front', 'front-three-quarter', 'side', 'rear-three-quarter', 'rear'])) error('Camera view is invalid.', s.id);
+    if (c.aim !== undefined && !one(c.aim, ['body', 'upper-body', 'face', 'eyes', 'interaction'])) error('Camera aim is invalid.', s.id);
+    if (c.reference === 'interaction-axis' && (!c.secondaryId || c.secondaryId === c.subjectId)) error('Interaction-axis camera requires a distinct secondary subject.', s.id);
+    if (c.aim === 'interaction' && (!c.secondaryId || c.secondaryId === c.subjectId)) error('Interaction aim requires a distinct secondary subject.', s.id);
+    if (c.screenPosition !== undefined && (!vec(c.screenPosition, 2) || c.screenPosition.some((value: number) => Math.abs(value) > 0.45))) error('Camera screenPosition axes must be finite and within [-0.45,0.45].', s.id);
     for (const k of ['lensMm', 'distance', 'height', 'azimuth']) if (c[k] !== undefined && !finite(c[k])) error(`Camera ${k} must be finite.`, s.id);
     if (c.lensMm !== undefined && (c.lensMm < 12 || c.lensMm > 200)) error('lensMm must be within [12,200].', s.id);
     if (c.distance !== undefined && (c.distance <= 0 || c.distance > 500)) error('Camera distance must be within (0,500].', s.id);
+    if (c.framing === 'close-up' && c.aim !== undefined && !['face', 'eyes'].includes(c.aim)) error('Close-up framing must aim at face or eyes.', s.id, 'invalid_close_up');
+    if (s.transition !== undefined) {
+      if (!record(s.transition)) error('Shot transition must be an object.', s.id);
+      else {
+        keys(s.transition, ['type', 'duration', 'motivation'], 'transition');
+        if (!one(s.transition.type, ['cut', 'ease-in-out']) || !one(s.transition.motivation, ['action', 'look', 'reaction', 'reveal', 'reestablish', 'rhythm'])) error('Shot transition type or motivation is invalid.', s.id);
+        if (s.transition.type === 'ease-in-out' && (!finite(s.transition.duration) || s.transition.duration <= 0 || s.transition.duration > Math.min(5, s.duration))) error('Ease transition duration must be within the shot and no more than 5 seconds.', s.id);
+        if (s.transition.type === 'cut' && s.transition.duration !== undefined) error('Cut transitions cannot have duration.', s.id);
+      }
+    }
     if (s.subtitle !== undefined && typeof s.subtitle !== 'string') error('Subtitle must be a string.', s.id);
   }
   for (const a of d.actions) {

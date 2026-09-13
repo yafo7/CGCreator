@@ -55,6 +55,7 @@ export const PLAYER_MODEL_COLLIDER_PROFILE: ModelColliderProfile = {
 
 interface ModelNode {
   id?: string;
+  name?: string;
   parent?: string;
   transform?: {
     pos?: Vec3;
@@ -65,6 +66,15 @@ interface ModelNode {
     type?: string;
     params?: Record<string, unknown>;
   };
+}
+
+export interface ModelSemanticLandmarks {
+  body: Vec3;
+  upperBody: Vec3;
+  face: Vec3;
+  eyes: Vec3;
+  faceHeight: number;
+  source: 'named-head' | 'proportional-fallback';
 }
 
 interface ModelJson {
@@ -106,6 +116,53 @@ export function calculateModelHitBounds(modelJson: unknown): Aabb {
 export function calculateModelVisualBounds(modelJson: unknown): Aabb {
   const { rawBounds } = collectModelMeshBounds(modelJson);
   return cloneBounds(normalizeLikeClient(rawBounds ?? FALLBACK_BOUNDS));
+}
+
+/**
+ * Extracts camera landmarks from named head/face/eye nodes and their mesh descendants.
+ * Generated assets without semantic names receive conservative human-proportion fallbacks.
+ * Returned points match the renderer's centered-X/Z, floor-aligned model coordinates.
+ */
+export function calculateModelSemanticLandmarks(modelJson: unknown): ModelSemanticLandmarks {
+  const data = modelJson as ModelJson;
+  const nodes = Array.isArray(data?.nodes) ? data.nodes : [];
+  const nodeById = new Map(nodes.filter((node) => typeof node.id === 'string' && node.id).map((node) => [node.id!, node]));
+  const headLike = (node: ModelNode | undefined): boolean => /(^|[_\s-])(head|face|eye|eyes|skull|头|脸|眼)([_\s-]|$)/i.test(`${node?.id ?? ''} ${node?.name ?? ''}`);
+  const belongsToHead = (node: ModelNode): boolean => {
+    const seen = new Set<ModelNode>();
+    let current: ModelNode | undefined = node;
+    while (current && !seen.has(current)) {
+      if (headLike(current)) return true;
+      seen.add(current);
+      current = typeof current.parent === 'string' ? nodeById.get(current.parent) : undefined;
+    }
+    return false;
+  };
+  const collected = collectModelMeshBounds(modelJson);
+  const overall = normalizeLikeClient(collected.rawBounds ?? FALLBACK_BOUNDS);
+  let headBounds: Aabb | null = null;
+  for (const mesh of collected.meshes) {
+    const node = mesh.sourceNodeId ? nodeById.get(mesh.sourceNodeId) : undefined;
+    if (!node || !belongsToHead(node)) continue;
+    const normalized = normalizeChildLikeClient(mesh.bounds, collected.rawBounds ?? FALLBACK_BOUNDS);
+    headBounds = includePoint(includePoint(headBounds, normalized.min), normalized.max);
+  }
+  const height = Math.max(0.1, overall.max[1] - overall.min[1]);
+  const body: Vec3 = [0, overall.min[1] + height * 0.5, 0];
+  const upperBody: Vec3 = [0, overall.min[1] + height * 0.7, 0];
+  if (!headBounds) {
+    const faceHeight = height * 0.22;
+    return { body, upperBody, face: [0, overall.min[1] + height * 0.84, 0], eyes: [0, overall.min[1] + height * 0.89, 0], faceHeight, source: 'proportional-fallback' };
+  }
+  const faceHeight = Math.max(height * 0.12, headBounds.max[1] - headBounds.min[1]);
+  return {
+    body,
+    upperBody,
+    face: [(headBounds.min[0] + headBounds.max[0]) / 2, headBounds.min[1] + faceHeight * 0.52, (headBounds.min[2] + headBounds.max[2]) / 2],
+    eyes: [(headBounds.min[0] + headBounds.max[0]) / 2, headBounds.min[1] + faceHeight * 0.66, (headBounds.min[2] + headBounds.max[2]) / 2],
+    faceHeight,
+    source: 'named-head'
+  };
 }
 
 export function buildModelColliderPlan(

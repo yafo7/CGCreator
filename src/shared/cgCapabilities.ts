@@ -1,11 +1,16 @@
 /** Public negotiation surface. A skill may recommend only capabilities enabled here. */
 export const CG_CAPABILITIES = {
   schemaVersion: 1,
-  version: 'cgcreator-0.1.0',
+  version: 'cgcreator-0.2.0',
   coordinateSystem: { up: 'Y', unit: 'metre', cameraRotation: 'quaternion', cameraFov: 'vertical-degrees' },
   camera: {
     movements: ['static', 'dolly', 'tracking', 'orbit'],
-    framings: ['wide', 'medium', 'close-up', 'over-shoulder']
+    framings: ['wide', 'medium', 'close-up', 'over-shoulder'],
+    references: ['world', 'subject-facing', 'subject-motion', 'interaction-axis'],
+    views: ['front', 'front-three-quarter', 'side', 'rear-three-quarter', 'rear'],
+    aims: ['body', 'upper-body', 'face', 'eyes', 'interaction'],
+    transitions: ['cut', 'ease-in-out'],
+    authoredAspectRatio: '16:9'
   },
   actions: ['move', 'face', 'animate', 'visibility', 'effect'],
   effects: ['spark'],

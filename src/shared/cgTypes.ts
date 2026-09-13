@@ -4,6 +4,9 @@ import type { RenderScheme } from './renderScheme';
 
 export type CgVec3 = [number, number, number];
 export type CgQuat = [number, number, number, number];
+export type CgCameraReference = 'world' | 'subject-facing' | 'subject-motion' | 'interaction-axis';
+export type CgCameraView = 'front' | 'front-three-quarter' | 'side' | 'rear-three-quarter' | 'rear';
+export type CgCameraAim = 'body' | 'upper-body' | 'face' | 'eyes' | 'interaction';
 export interface CgAnchor {
   id: string;
   name: string;
@@ -36,6 +39,19 @@ export interface CgCameraIntent {
   distance?: number;
   height?: number;
   azimuth?: number;
+  /** Coordinate frame used to interpret view/azimuth. Subject-relative frames turn with the performance. */
+  reference?: CgCameraReference;
+  /** Where the camera sits around the subject inside the selected reference frame. */
+  view?: CgCameraView;
+  /** Semantic model region kept in composition. */
+  aim?: CgCameraAim;
+  /** Desired subject position in normalized screen coordinates, each axis in [-0.45, 0.45]. */
+  screenPosition?: [number, number];
+}
+export interface CgShotTransition {
+  type: 'cut' | 'ease-in-out';
+  duration?: number;
+  motivation: 'action' | 'look' | 'reaction' | 'reveal' | 'reestablish' | 'rhythm';
 }
 export interface CgShot {
   id: string;
@@ -43,6 +59,7 @@ export interface CgShot {
   purpose: string;
   duration: number;
   camera: CgCameraIntent;
+  transition?: CgShotTransition;
   subtitle?: string;
 }
 export interface CgAction {
@@ -121,8 +138,15 @@ export interface CgEntityState {
   socketId?: string;
 }
 export interface CgCameraPose { position: CgVec3; quaternion: CgQuat; fov: number; target?: CgVec3 }
-export interface CgBinding { entityId: string; objectId: string; assetId: string | null; height: number }
-export interface CgCompiledShot { id: string; start: number; end: number; camera: CgCameraIntent; lockedPose?: CgCameraPose; inputHash: string }
+export interface CgBinding {
+  entityId: string;
+  objectId: string;
+  assetId: string | null;
+  height: number;
+  /** Model-local, floor-aligned semantic points used by camera composition. */
+  focus?: { body: CgVec3; upperBody: CgVec3; face: CgVec3; eyes: CgVec3; faceHeight: number; source: 'named-head' | 'proportional-fallback' };
+}
+export interface CgCompiledShot { id: string; start: number; end: number; camera: CgCameraIntent; transition?: CgShotTransition; lockedPose?: CgCameraPose; inputHash: string }
 export interface CgCompiledAction extends Omit<CgAction, 'start'> {
   start: number;
   end: number;
@@ -179,4 +203,3 @@ export interface CgProject {
 }
 export interface CgProjectSummary { id: string; title: string; mapId: string; revision: number; confirmed: boolean; updatedAt: number }
 export interface CgProgress { stage: string; message: string }
-

@@ -49,6 +49,64 @@ describe('CG deterministic compiler', () => {
     expect(a.map.objects[0].behavior?.animation?.state).toBe('cg-owned');
   });
 
+  it('keeps rear and side tracking views relative to the actor motion', () => {
+    const { document, map } = fixture();
+    document.shots[0].camera = { movement: 'tracking', framing: 'wide', subjectId: 'hero', reference: 'subject-motion', view: 'rear-three-quarter', aim: 'body', side: 'right' };
+    const rear = compileDirector(document, map);
+    const rearFrame = evaluateCG(rear, 2);
+    expect(rearFrame.camera.position[0]).toBeLessThan(rearFrame.entities.hero.position[0]);
+
+    document.shots[0].camera.view = 'side';
+    const side = compileDirector(document, map);
+    const sideFrame = evaluateCG(side, 2);
+    const alongMotion = sideFrame.camera.position[0] - sideFrame.entities.hero.position[0];
+    const lateral = sideFrame.camera.position[2] - sideFrame.entities.hero.position[2];
+    expect(Math.abs(alongMotion)).toBeLessThan(Math.abs(lateral));
+  });
+
+  it('uses named eye landmarks and a portrait lens for semantic close-ups', () => {
+    const { document, map } = fixture();
+    const modelJson = { version: '1.0', nodes: [
+      { id: 'torso', transform: { pos: [0, 0.7, 0] }, mesh: { type: 'box', params: { width: 0.6, height: 1.4, depth: 0.4 } } },
+      { id: 'head', transform: { pos: [0, 1.55, 0] }, mesh: { type: 'box', params: { width: 0.42, height: 0.42, depth: 0.42 } } }
+    ] };
+    map.assets![0] = { ...map.assets![0], modelJson, colliderPlan: buildModelColliderPlan(modelJson) };
+    document.shots[1].camera = { movement: 'static', framing: 'close-up', subjectId: 'hero', reference: 'subject-facing', view: 'front-three-quarter', aim: 'eyes', lensMm: 85 };
+    const result = compileDirector(document, map);
+    const frame = evaluateCG(result, 5);
+    expect(result.bindings[0].focus?.source).toBe('named-head');
+    expect(frame.camera.target?.[1]).toBeGreaterThan(1.5);
+    expect(frame.camera.fov).toBeLessThan(20);
+    expect(result.validation.diagnostics.some((item) => item.code === 'face_landmark_fallback')).toBe(false);
+  });
+
+  it('blends only an explicitly eased shot handoff and diagnoses weak cuts', () => {
+    const { document, map } = fixture();
+    document.shots[0].camera = { movement: 'tracking', framing: 'medium', subjectId: 'hero', reference: 'subject-motion', view: 'side', aim: 'upper-body' };
+    document.shots[1].camera = { movement: 'static', framing: 'medium', subjectId: 'hero', reference: 'subject-facing', view: 'side', aim: 'upper-body' };
+    let result = compileDirector(document, map);
+    expect(result.validation.diagnostics.some((item) => item.code === 'jump_cut_risk')).toBe(true);
+    const cutPose = evaluateCG(result, 5).camera;
+
+    document.shots[1].transition = { type: 'ease-in-out', duration: 1, motivation: 'reaction' };
+    document.shots[1].camera.view = 'front';
+    result = compileDirector(document, map);
+    const easedStart = evaluateCG(result, 5).camera;
+    const previousEnd = evaluateCG(result, 4.999999).camera;
+    expect(easedStart.position).toEqual(previousEnd.position);
+    expect(evaluateCG(result, 5.5).camera.position).not.toEqual(cutPose.position);
+    expect(evaluateCG(result, 5.5)).toEqual(evaluateCG(result, 5.5));
+  });
+
+  it('rejects close-ups aimed at the body and invalid interaction axes', () => {
+    const { document } = fixture();
+    document.shots[1].camera.aim = 'body';
+    document.shots[1].camera.reference = 'interaction-axis';
+    const validation = validateDirectorDocument(document);
+    expect(validation.diagnostics.some((item) => item.code === 'invalid_close_up')).toBe(true);
+    expect(validation.diagnostics.some((item) => item.message.includes('distinct secondary'))).toBe(true);
+  });
+
   it('routes around collision geometry and reaches the exact anchor', () => {
     const { document, map } = fixture();
     const wall = createMapObject('Obstacle'); wall.id = 'obstacle'; wall.transform.position = [0, 0, 0]; wall.transform.size = [1.5, 2, 2.5]; map.objects.push(wall);

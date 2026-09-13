@@ -11,6 +11,8 @@ const escape = (value: unknown): string => String(value ?? '').replace(/[&<>"']/
 const seconds = (value: number): string => Number.isFinite(value) ? value.toFixed(2) : '0.00';
 const movement: Record<string, string> = { static: '固定', dolly: '推镜', tracking: '跟拍', orbit: '环绕' };
 const framing: Record<string, string> = { wide: '全景', medium: '中景', 'close-up': '特写', 'over-shoulder': '越肩' };
+const cameraView: Record<string, string> = { front: '正面', 'front-three-quarter': '前侧 3/4', side: '侧面', 'rear-three-quarter': '后侧 3/4', rear: '背面' };
+const cameraAim: Record<string, string> = { body: '全身构图', 'upper-body': '上半身构图', face: '面部对焦', eyes: '眼部对焦', interaction: '互动构图' };
 const actionName: Record<string, string> = { move: '移动', face: '朝向', animate: '动作', visibility: '显隐', effect: '特效', attach: '附着', detach: '分离' };
 
 export function parseCgTarget(value: string): { kind: string; targetId: string } {
@@ -63,7 +65,7 @@ class CgWorkspace {
     this.root.tabIndex = -1;
     this.root.setAttribute('aria-label', 'CGCreator 实机演出工作区');
     this.root.innerHTML = `
-      <header class="cg-header"><div class="cg-brand"><span class="cg-logo">C<span>G</span></span><div><strong>CGCreator</strong><small>实时 3D 演出工作台</small></div><span class="cg-version">V 0.1</span></div>
+      <header class="cg-header"><div class="cg-brand"><span class="cg-logo">C<span>G</span></span><div><strong>CGCreator</strong><small>实时 3D 演出工作台</small></div><span class="cg-version">V 0.2</span></div>
         <div class="cg-source"><span class="cg-status-dot"></span><span data-cg="source"></span><span class="cg-source-tag">WorldForge 快照</span></div>
         <div class="cg-header-actions"><button data-do="import">导入演出</button><button data-do="export" disabled>导出已确认</button><button data-do="close" class="cg-close">返回地图 ↗</button></div>
       </header>
@@ -290,10 +292,10 @@ class CgWorkspace {
     const doc = this.document;
     this.text('shot-count', `${doc?.shots.length ?? 0} SHOTS`);
     this.text('resource-count', String(this.project?.resources.models.length ?? this.bundle?.resources.models.length ?? 0));
-    this.el('shots').innerHTML = doc?.shots.map((shot, index) => `<button data-do="shot" data-id="${escape(shot.id)}" class="cg-shot ${shot.id === this.selectedShot ? 'selected' : ''}"><span class="cg-shot-number">${String(index + 1).padStart(2, '0')}</span><span><strong>${escape(shot.name)}</strong><small>${escape(movement[shot.camera.movement])} · ${escape(framing[shot.camera.framing])}</small></span><span class="cg-shot-duration">${seconds(this.effectiveDuration(shot.id))}s</span></button>`).join('') || '<div class="cg-empty">写下导演意图，或体验内置演出。镜头与动作将在这里展开。</div>';
+    this.el('shots').innerHTML = doc?.shots.map((shot, index) => `<button data-do="shot" data-id="${escape(shot.id)}" class="cg-shot ${shot.id === this.selectedShot ? 'selected' : ''}"><span class="cg-shot-number">${String(index + 1).padStart(2, '0')}</span><span><strong>${escape(shot.name)}</strong><small>${escape(movement[shot.camera.movement])} · ${escape(framing[shot.camera.framing])}${shot.camera.view ? ` · ${escape(cameraView[shot.camera.view])}` : ''}</small></span><span class="cg-shot-duration">${seconds(this.effectiveDuration(shot.id))}s</span></button>`).join('') || '<div class="cg-empty">写下导演意图，或体验内置演出。镜头与动作将在这里展开。</div>';
     this.el('entities').innerHTML = doc?.entities.map(entity => `<div><span class="cg-entity-icon">${entity.kind === 'actor' ? '♙' : '◇'}</span><span><strong>${escape(entity.name)}</strong><small>${entity.objectId ? '绑定地图物体' : entity.assetId ? '演出资源' : '待解析资源'}</small></span></div>`).join('') ?? '';
     const shot = doc?.shots.find(value => value.id === this.selectedShot);
-    this.el('selection').innerHTML = shot ? `<span class="cg-eyebrow">SHOT ${String((doc?.shots.indexOf(shot) ?? 0) + 1).padStart(2, '0')}</span><h2>${escape(shot.name)}</h2><p>${escape(shot.purpose)}</p><div class="cg-chips"><span>${escape(movement[shot.camera.movement])}</span><span>${escape(framing[shot.camera.framing])}</span><span>${seconds(this.effectiveDuration(shot.id))} 秒</span></div>` : '<h2>让意图成为演出</h2><p>选择镜头后，可以调整景别、节奏与机位。</p>';
+    this.el('selection').innerHTML = shot ? `<span class="cg-eyebrow">SHOT ${String((doc?.shots.indexOf(shot) ?? 0) + 1).padStart(2, '0')}</span><h2>${escape(shot.name)}</h2><p>${escape(shot.purpose)}</p><div class="cg-chips"><span>${escape(movement[shot.camera.movement])}</span><span>${escape(framing[shot.camera.framing])}</span>${shot.camera.view ? `<span>${escape(cameraView[shot.camera.view])}</span>` : ''}${shot.camera.aim ? `<span>${escape(cameraAim[shot.camera.aim])}</span>` : ''}<span>${seconds(this.effectiveDuration(shot.id))} 秒</span></div>` : '<h2>让意图成为演出</h2><p>选择镜头后，可以调整景别、节奏与机位。</p>';
     if (shot) this.el<HTMLInputElement>('duration').value = String(this.effectiveDuration(shot.id));
     const oldTarget = this.el<HTMLSelectElement>('lock-target').value;
     this.el('lock-target').innerHTML = (doc?.entities.map(entity => `<option value="entity:${escape(entity.id)}">${entity.kind === 'actor' ? '角色起点' : '道具位置'} · ${escape(entity.name)}</option>`).join('') ?? '') + (doc?.actions.filter(action => action.type === 'move').map(action => `<option value="action:${escape(action.id)}">移动终点 · ${escape(doc.entities.find(entity => entity.id === action.entityId)?.name ?? action.entityId)} (${escape(action.id)})</option>`).join('') ?? '');

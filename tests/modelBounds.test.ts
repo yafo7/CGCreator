@@ -3,6 +3,7 @@ import {
   MAP_ASSET_COLLIDER_PROFILE,
   PLAYER_MODEL_COLLIDER_PROFILE,
   buildModelColliderPlan,
+  calculateModelSemanticLandmarks,
   calculateModelVisualBounds,
   modelColliderVisibilityPoints,
   modelColliderWorldAabbs,
@@ -47,6 +48,16 @@ const splitModel = {
 };
 
 describe('voxel-style model collider plans', () => {
+  it('derives face and eye targets from a named head hierarchy', () => {
+    const landmarks = calculateModelSemanticLandmarks({ format: 2, nodes: [
+      { id: 'torso', transform: { pos: [0, 0.7, 0] }, mesh: { type: 'box', params: { width: 0.6, height: 1.4, depth: 0.4 } } },
+      { id: 'head', transform: { pos: [0, 1.55, 0] }, mesh: { type: 'box', params: { width: 0.42, height: 0.42, depth: 0.42 } } }
+    ] });
+
+    expect(landmarks.source).toBe('named-head');
+    expect(landmarks.face[1]).toBeGreaterThan(1.45);
+    expect(landmarks.eyes[1]).toBeGreaterThan(landmarks.face[1]);
+  });
   it('keeps the true visual bottom even when thin furniture legs are omitted from collision', () => {
     const visual = calculateModelVisualBounds(thinLegChair);
     const collider = buildModelColliderPlan(thinLegChair, MAP_ASSET_COLLIDER_PROFILE);
