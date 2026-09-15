@@ -1,9 +1,11 @@
 import { randomUUID } from 'node:crypto';
 import type { CgClip, CgMapSyncSummary, CgPatchOperation, CgProgress, CgProject, CgResources, CgVec3, DirectorDocument } from '../shared/cgTypes';
+import { assertGenerationDescription, emptyPreparation, selectedPreparedVersion, type CgPreparedAssetVersion } from '../shared/cgPreparation';
 import { applyDirectorPatch, compileDirector } from '../shared/cgCompiler';
 import { stableHash, validateDirectorDocument } from '../shared/cgValidation';
 import { getMapBounds, getMapObjectAabbs, getObjectWorldTransforms, sampleTerrainHeight, type EditableMap, type MapAsset } from '../shared/map';
-import { buildModelColliderPlan } from '../shared/modelBounds';
+import { buildModelColliderPlan, calculateModelSemanticLandmarks } from '../shared/modelBounds';
+import { buildPoseRig } from '../shared/cgPoseEvaluator';
 import type { RenderScheme } from '../shared/renderScheme';
 import { MODEL_API_BASE } from '../shared/protocol';
 import { generateModel, llmChat, type ChatMessage } from './modelApi';
@@ -41,7 +43,121 @@ export class CgService {
     this.assertMap(map);
     const id = `cg_${randomUUID()}`;
     const document: DirectorDocument = { schemaVersion: 1, id: `director_${randomUUID()}`, title: title?.trim() || `${map.name} · CG`, sourcePrompt: '', revision: 0, seed: map.seed, mapId: map.id, entities: [], anchors: [], shots: [], actions: [], constraints: [], worldPatch: [] };
-    return this.store.create({ schemaVersion: 1, id, title: document.title, revision: 0, mapSnapshot: clone(map), schemeSnapshot: clone(scheme), document, resources: { models: [], clips: [] }, candidate: null, confirmed: null, updatedAt: Date.now() });
+    return this.store.create({ schemaVersion: 1, id, title: document.title, revision: 0, mapSnapshot: clone(map), schemeSnapshot: clone(scheme), document, resources: { models: [], clips: [] }, preparation: emptyPreparation(), candidate: null, confirmed: null, updatedAt: Date.now() });
+  }
+
+  /** Prepare a reusable actor or prop before directing. Generation stays concise; scene rules remain in the compiler. */
+  async prepareAsset(id: string, revision: number, input: { name?: string; kind?: unknown; description?: unknown; referenceAssetIds?: unknown }) {
+    assertGenerationDescription(input.description);
+    const kind = input.kind === 'actor' || input.kind === 'prop' ? input.kind : fail('invalid_asset_kind', '资源类型必须是 actor 或 prop。');
+    const description = input.description.trim();
+    const name = typeof input.name === 'string' && input.name.trim() ? input.name.trim().slice(0, 80) : description;
+    const requestedRefs = Array.isArray(input.referenceAssetIds) ? input.referenceAssetIds.filter((item): item is string => typeof item === 'string').slice(0, 3) : [];
+    const base = await this.store.read(id);
+    if (base.revision !== revision) throw new CgHttpError(409, 'revision_conflict', '项目已更新，请重新打开最新版本后重试。');
+    const basePreparation = base.preparation ?? emptyPreparation();
+    const references = requestedRefs.map(assetId => selectedPreparedVersion(basePreparation, assetId)).filter((value): value is CgPreparedAssetVersion => !!value);
+    const key = `prepared_model_${stableHash({ description, kind, refs: references.map(item => item.modelHash) })}`;
+    // Remote generation deliberately occurs outside project CAS: the cache remains useful if the user edits meanwhile.
+    return this.run(id, 'preparing', `制作${kind === 'actor' ? '角色' : '道具'}：${name}`, async () => {
+      let modelJson = await this.store.cached<unknown>(key);
+      if (!modelJson) {
+        modelJson = this.options.model
+          ? await this.options.model(description, base.document.seed)
+          : await generateModel(description, {
+            apiBase: process.env.CG_MODEL_API_BASE,
+            mode: 'standard', seeded: false,
+            refs: references.map(ref => ({ model: ref.model.modelJson, note: '保持风格' })),
+            signal: AbortSignal.timeout(300_000)
+          });
+        assertModel(modelJson);
+        await this.store.cache(key, modelJson);
+      }
+      assertModel(modelJson);
+      return this.store.transaction(id, revision, project => {
+      const preparation = project.preparation ?? emptyPreparation();
+      const assetId = `asset_${randomUUID()}`, versionId = `assetv_${randomUUID()}`, now = Date.now();
+      const model: MapAsset = {
+        id: versionId,
+        name,
+        prompt: description,
+        modelJson,
+        colliderPlan: buildModelColliderPlan(modelJson),
+        mode: 'json', provider: '3d-generate', createdAt: now, updatedAt: now
+      };
+      const rig = buildPoseRig(modelJson), landmarks = calculateModelSemanticLandmarks(modelJson);
+      preparation.assets.push({ id: assetId, name, kind, description, selectedVersionId: versionId, versionIds: [versionId], createdAt: now, updatedAt: now });
+      preparation.versions.push({
+        id: versionId, assetId, source: 'generated', description, model, modelHash: stableHash(modelJson), createdAt: now,
+        capabilities: {
+          locomotion: kind === 'actor' && rig.nodes.length > 1,
+          faceCloseup: kind === 'actor' && !!landmarks,
+          sit: rig.contactProfile ? 'ready' : 'needs-rig',
+          hold: rig.nodes.some(node => /hand|手/i.test(node.id)) ? 'ready' : 'needs-socket'
+        }
+      });
+      project.preparation = preparation;
+      project.candidate = null;
+      });
+    });
+  }
+
+  /** Save a full-editor result as a new immutable version; existing confirmed CGs keep their old model. */
+  async savePreparedVersion(id: string, revision: number, input: { assetId?: unknown; modelJson?: unknown; description?: unknown }) {
+    const suppliedDescription = input.description;
+    assertGenerationDescription(suppliedDescription);
+    assertModel(input.modelJson);
+    return this.store.transaction(id, revision, project => {
+      const preparation = project.preparation ?? emptyPreparation();
+      const assetId = typeof input.assetId === 'string' ? input.assetId : '';
+      const asset = preparation.assets.find(item => item.id === assetId);
+      if (!asset) fail('prepared_asset_not_found', '准备资源不存在。');
+      const parent = selectedPreparedVersion(preparation, assetId);
+      if (!parent) fail('prepared_version_not_found', '准备资源没有可编辑版本。');
+      const now = Date.now(), versionId = `assetv_${randomUUID()}`, description = suppliedDescription.trim();
+      const model: MapAsset = { ...parent.model, id: versionId, prompt: description, modelJson: clone(input.modelJson), colliderPlan: buildModelColliderPlan(input.modelJson), updatedAt: now };
+      const rig = buildPoseRig(input.modelJson), landmarks = calculateModelSemanticLandmarks(input.modelJson);
+      preparation.versions.push({ ...parent, id: versionId, parentVersionId: parent.id, source: 'edited', description, model, modelHash: stableHash(input.modelJson), createdAt: now, capabilities: { locomotion: asset.kind === 'actor' && rig.nodes.length > 1, faceCloseup: asset.kind === 'actor' && !!landmarks, sit: rig.contactProfile ? 'ready' : 'needs-rig', hold: rig.nodes.some(node => /hand|手/i.test(node.id)) ? 'ready' : 'needs-socket' } });
+      asset.selectedVersionId = versionId; asset.versionIds.push(versionId); asset.description = description; asset.updatedAt = now;
+      project.preparation = preparation;
+      project.candidate = null;
+    });
+  }
+
+  /** Bake one reusable motion against the selected immutable model version. */
+  async prepareMotion(id: string, revision: number, input: { assetId?: unknown; name?: unknown; description?: unknown }) {
+    const suppliedDescription = input.description;
+    assertGenerationDescription(suppliedDescription);
+    const assetId = typeof input.assetId === 'string' ? input.assetId : '';
+    const base = await this.store.read(id);
+    if (base.revision !== revision) throw new CgHttpError(409, 'revision_conflict', '项目已更新，请重新打开最新版本后重试。');
+    const preparation = base.preparation ?? emptyPreparation();
+    const asset = preparation.assets.find(item => item.id === assetId);
+    const version = selectedPreparedVersion(preparation, assetId);
+    if (!asset || !version) fail('prepared_asset_not_found', '请先选择已准备的角色或道具。');
+    const description = suppliedDescription.trim(), name = typeof input.name === 'string' && input.name.trim() ? input.name.trim().slice(0, 80) : description;
+    const key = `prepared_motion_${stableHash({ model: version.modelHash, description })}`;
+    return this.run(id, 'preparing-motion', `制作动作：${name}`, async () => {
+      let template = await this.store.cached<Omit<CgClip, 'id' | 'entityId'>>(key);
+      if (!template) {
+        const baked = this.options.animation
+          ? await this.options.animation(version.model.modelJson, description, 0)
+          : await requestBakedAnimation(version.model.modelJson, description);
+        const decoded = decodeBakedClip(baked, { id: 'prepared', entityId: 'prepared', modelHash: version.modelHash, description }, version.model.modelJson);
+        const { id: _id, entityId: _entityId, ...preparedTemplate } = decoded;
+        template = preparedTemplate;
+        await this.store.cache(key, template);
+      }
+      return this.store.transaction(id, revision, project => {
+        const current = project.preparation ?? emptyPreparation();
+        const currentVersion = selectedPreparedVersion(current, assetId);
+        if (!currentVersion || currentVersion.id !== version.id) fail('prepared_version_changed', '角色模型版本已变化，请重新制作动作。');
+        const now = Date.now();
+        current.motions.push({ id: `motion_${randomUUID()}`, assetVersionId: version.id, name, description, naturalDuration: template!.duration, loop: template!.loop, clip: template!, createdAt: now });
+        project.preparation = current;
+        project.candidate = null;
+      });
+    });
   }
 
   async syncMap(id: string, revision: number, map: EditableMap, scheme: RenderScheme | null): Promise<{ project: CgProject; summary: CgMapSyncSummary }> {
@@ -77,7 +193,7 @@ export class CgService {
         const semantic = buildSemanticContext(project.mapSnapshot);
         const answer = await this.directorAnswer([
           { role: 'system', content: DIRECTOR_SYSTEM_PROMPT },
-          { role: 'user', content: JSON.stringify({ intent: prompt, map: semantic, documentIdentity: { id: project.document.id, mapId: project.mapSnapshot.id, revision: project.document.revision + 1, seed: project.document.seed }, existingDocument: project.document.shots.length ? project.document : null }) }
+          { role: 'user', content: JSON.stringify({ intent: prompt, map: semantic, preparedAssets: preparedAssetsForDirector(project), documentIdentity: { id: project.document.id, mapId: project.mapSnapshot.id, revision: project.document.revision + 1, seed: project.document.seed }, existingDocument: project.document.shots.length ? project.document : null }) }
         ], project.mapSnapshot);
         assertSupportedAnswer(answer, 'unsupported_intent');
         document = answer as DirectorDocument;
@@ -194,6 +310,15 @@ export class CgService {
   }
 
   private async resolveResources(project: CgProject) {
+    const preparation = project.preparation ?? emptyPreparation();
+    // The document stores the user-owned asset ID. Resolve it to this selected immutable version.
+    for (const asset of preparation.assets) {
+      const version = selectedPreparedVersion(preparation, asset.id);
+      if (!version) continue;
+      const model = { ...clone(version.model), id: asset.id };
+      project.resources.models = project.resources.models.filter(item => item.id !== asset.id);
+      project.resources.models.push(model);
+    }
     const models = new Map([...project.mapSnapshot.assets ?? [], ...project.resources.models].map((a) => [a.id, a]));
     for (const entity of project.document.entities) {
       const object = project.mapSnapshot.objects.find((o) => o.id === entity.objectId);
@@ -220,15 +345,23 @@ export class CgService {
         const clipId = action.clipId!;
         if (!clipId) fail('missing_clip_id', '移动和交互行为需要稳定的 clipId。');
         const modelHash = stableHash(model.modelJson);
+        const selectedVersion = selectedPreparedVersion(preparation, entity.assetId);
+        const preparedMotion = selectedVersion ? preparation.motions.find(motion => motion.id === clipId && motion.assetVersionId === selectedVersion.id) : undefined;
+        if (preparedMotion) {
+          if (preparedMotion.clip.modelHash !== modelHash) fail('prepared_motion_mismatch', `动作 ${preparedMotion.name} 与当前模型版本不匹配。`);
+          project.resources.clips = project.resources.clips.filter(clip => clip.id !== clipId);
+          project.resources.clips.push({ ...preparedMotion.clip, id: clipId, entityId: entity.id, modelHash });
+          continue;
+        }
         const existing = project.resources.clips.find((c) => c.id === clipId);
         if (existing?.entityId === entity.id && existing.modelHash === modelHash && (action.type !== 'sit' || Math.abs(existing.duration - action.duration) < 1e-4)) continue;
         if (existing && existing.entityId !== entity.id) fail('shared_clip_id', '不同角色不能共享同一个 clipId；动画必须绑定到明确的角色和模型。');
-        const description = `In-place local animation ${clipId}. Behavior: ${action.type}; ${action.purpose ?? ''}; locomotion: ${action.route?.locomotion ?? 'none'}. Character: ${entity.name}. Scene intent: ${project.document.sourcePrompt}. ${action.type === 'sit' ? 'Produce a non-looping sit-down transition that ends in a seated pose, never blends back to standing. The contact solver owns root positioning. The actor must expose a cgRig contact profile; do not invent absent joints.' : ''} Animate only existing node IDs. The cutscene owns world translation: root nodes must have zero X/Z translation. No particles or camera motion.`;
-        const key = `clip_${stableHash({ modelHash, description, duration: action.duration })}`;
+        const description = action.purpose?.trim().slice(0, 180) || (action.type === 'sit' ? '坐下后保持坐姿' : action.type === 'move' ? '原地跑步' : '自然的原地动作');
+        const key = `clip_${stableHash({ modelHash, description })}`;
         let clip = await this.store.cached<CgClip>(key);
         if (!clip) {
           this.progress.set(project.id, { stage: 'animation', message: `通过 3d-generate 烘焙动作：${clipId}`, running: true });
-          const baked = await (this.options.animation ? this.options.animation(model.modelJson, description, action.duration) : requestBakedAnimation(model.modelJson, description, action.duration));
+          const baked = await (this.options.animation ? this.options.animation(model.modelJson, description, action.duration) : requestBakedAnimation(model.modelJson, description));
           clip = decodeBakedClip(baked, { id: clipId, entityId: entity.id, modelHash, description }, model.modelJson);
           await this.store.cache(key, clip);
         }
@@ -328,11 +461,27 @@ export function buildSemanticContext(map: EditableMap) {
   return { id: map.id, name: map.name, axis: 'Y-up', units: 'metres', bounds: getMapBounds(map), sceneMode: map.sceneMode, layout: map.layout, worldUnderstanding: worldSummary(fullIndex), designSemantics: fullIndex.designSemantics, semanticIndex: { schemaVersion: 1, mapId: map.id, mapVersion: map.version, sourceHash: fullIndex.sourceHash, spatialEntities, assetHierarchies }, objects: map.objects.map((o) => ({ id: o.id, name: o.name, assetId: o.assetId, visible: o.visible, locked: o.locked, worldTransform: transforms.get(o.id), tags: map.assets?.find((a) => a.id === o.assetId)?.tags ?? [] })), anchors };
 }
 
+function preparedAssetsForDirector(project: CgProject) {
+  const preparation = project.preparation ?? emptyPreparation();
+  return preparation.assets.flatMap(asset => {
+    const version = selectedPreparedVersion(preparation, asset.id);
+    if (!version) return [];
+    const model = version.model.modelJson as { nodes?: Array<{ id?: unknown; name?: unknown; label?: unknown; parent?: unknown; tags?: unknown }>; _meta?: { semanticSnapshot?: { text?: unknown } } };
+    return [{
+      id: asset.id, name: asset.name, kind: asset.kind, description: asset.description, selectedVersionId: version.id,
+      capabilities: version.capabilities,
+      motions: preparation.motions.filter(motion => motion.assetVersionId === version.id).map(motion => ({ id: motion.id, name: motion.name, description: motion.description, naturalDuration: motion.naturalDuration, loop: motion.loop })),
+      semanticSummary: typeof model._meta?.semanticSnapshot?.text === 'string' ? model._meta.semanticSnapshot.text.slice(0, 1000) : undefined,
+      nodes: (model.nodes ?? []).flatMap(node => typeof node.id === 'string' ? [{ id: node.id, name: typeof node.name === 'string' ? node.name : typeof node.label === 'string' ? node.label : node.id, ...(typeof node.parent === 'string' ? { parent: node.parent } : {}), ...(Array.isArray(node.tags) ? { tags: node.tags } : {}) }] : [])
+    }];
+  });
+}
+
 function compactViewSamples(samples: ReturnType<typeof inspectShotSamples>) {
   return samples.map((sample) => ({ ...sample, items: sample.items.map(({ semanticParts: _parts, ...item }) => item) }));
 }
 
-export const DIRECTOR_SYSTEM_PROMPT = `You direct an editable real-time 3D cutscene in WorldForge. Return ONLY a DirectorDocument JSON object. No code, video, prose, keyframes, executable expressions or invented map object IDs. Coordinates are Y-up metres; camera looks along its local -Z. Work from the supplied semantic map and exact existing IDs. semanticIndex.spatialEntities identifies placed objects and WorldForge group/focus/viewpoint/zone/guide/water/grass geography. semanticIndex.assetHierarchies preserves each reusable 3d-generate asset's model-part names and parents once; join it to placed instances by assetId. Ground location language such as pavilion, pond, forest, entrance or seat in those stable semantic IDs before choosing supplied anchors. Use supplied named anchors verbatim; never invent coordinates. New entities may reference a new stable assetId plus a precise description for 3d-generate; never pretend the model already exists. Prefer existing assets. New actors require startAnchorId. Existing map objects use objectId.
+export const DIRECTOR_SYSTEM_PROMPT = `You direct an editable real-time 3D cutscene in WorldForge. Return ONLY a DirectorDocument JSON object. No code, video, prose, keyframes, executable expressions or invented map object IDs. Coordinates are Y-up metres; camera looks along its local -Z. Work from the supplied semantic map and exact existing IDs. semanticIndex.spatialEntities identifies placed objects and WorldForge group/focus/viewpoint/zone/guide/water/grass geography. semanticIndex.assetHierarchies preserves each reusable 3d-generate asset's model-part names and parents once; join it to placed instances by assetId. preparedAssets are explicitly user-prepared actors and props: when one fits, use its exact id as entity.assetId and do not generate a duplicate. Ground location language such as pavilion, pond, forest, entrance or seat in those stable semantic IDs before choosing supplied anchors. Use supplied named anchors verbatim; never invent coordinates. New entities may reference a new stable assetId plus a precise description for 3d-generate; never pretend the model already exists. Prefer existing assets. New actors require startAnchorId. Existing map objects use objectId.
 Use the supplied documentIdentity unchanged, schemaVersion:2, title, sourcePrompt, entities, anchors, shots, actions, constraints, worldPatch. This is the PERFORMANCE planning stage: first ground actors, props, behavior goals, route choices, timing and interactions. For a NEW document return shots:[]; the service derives stable coverage slots and chooses cameras AFTER verifying the actual performance. Retain existing shots when replanning a document with camera locks. Every ID must be unique across nodes, ASCII letters/digits/_/-/:. Preserve every existing manual hard constraint and its anchor verbatim. A constraint cannot be dropped when replanning.
 Entity: {id,name,kind:'actor'|'prop',objectId?,assetId?,startAnchorId?,description?,height?}. Anchor: exact supplied object. Shots are sequential {id,name,purpose,duration,camera,transition?,subtitle?}. Camera is semantic {movement:'static'|'dolly'|'tracking'|'orbit',framing:'wide'|'medium'|'close-up'|'over-shoulder',subjectId,secondaryId?,side?:'left'|'right',lensMm?,distance?,height?,azimuth?,reference?:'world'|'subject-facing'|'subject-motion'|'interaction-axis',view?:'front'|'front-three-quarter'|'side'|'rear-three-quarter'|'rear',aim?:'body'|'upper-body'|'face'|'eyes'|'interaction',screenPosition?:[x,y]}. Every moving-subject shot must state reference, view and aim. Travel/context defaults to a side or rear-three-quarter view in subject-motion space; arrival defaults to rear or rear-three-quarter. Use a moving front view only when the purpose explicitly needs the face during motion. A close-up must aim at face/eyes in subject-facing space, use a 70–100mm lens, and normally omit distance/height so semantic landmarks determine both. Over-shoulder requires two distinct subjects and interaction-axis. Transition is {type:'cut'|'ease-in-out',duration?,motivation:'action'|'look'|'reaction'|'reveal'|'reestablish'|'rhythm'}; omit it on the first shot and use a motivated value afterward. Preserve screen direction and the 30-degree rule. Favor stable composition and restrained movement; camera movement cannot own actor motion.
 Actions own the performance timeline: {id,entityId,type:'move'|'face'|'animate'|'visibility'|'effect'|'sit'|'dialogue'|'hold',start:{kind:'absolute',seconds}|{kind:'after'|'with',id,offset?},duration,targetAnchorId?,targetEntityId?,clipId?,visible?,effect?:'spark',purpose?,route?,interaction?,endBehavior?}. V2 timing references other actions, NEVER shots. A move requires targetAnchorId; when using a road add route:{guideIds:[exact existing guide IDs],policy:'required'|'preferred',locomotion:'walk'|'run',maxSpeed?} and clipId for its own in-place gait. Do not overlay a second gait animate action. Use provided map_guide and map_seat anchors verbatim, including bindings. A sit requires clipId and interaction:{objectId,seatNodeId,approachAnchorId}; first move to that exact approach anchor and orient the actor. Sit is supported only for a stationary named box seat and an actor with explicit contactProfile hips/leftFoot/rightFoot landmarks; the solver must validate the actual clip and feet support. Never pretend an unprofiled model is contact-ready. Sit persists; hold keeps the seated state. Do not move or replace a seated actor's whole-body animation without a supported stand transition (currently unavailable). Dialogue requires targetEntityId for a distinct participant and means staged facing/turns only, not speech or lip sync. Animate supports endBehavior:'restore'|'hold'. A face needs a target entity or anchor. Effects support only spark. Do not invent attachment, physics, IK or unsupported motion. Do not overlap competing root actions or full-body animations. Preserve manual time and camera locks.
@@ -344,8 +493,9 @@ const REFINE_SYSTEM_PROMPT = `Return only a JSON array of narrowly scoped CgPatc
 ${CG_CAMERA_GRAMMAR_PROMPT}
 ${CG_WORLD_READING_PROMPT}`;
 
-async function requestBakedAnimation(modelJson: unknown, description: string, duration: number) {
-  const response = await fetch(`${process.env.CG_MODEL_API_BASE ?? MODEL_API_BASE}/api/generate/animation`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ mode: 'quick', modelJson, description, duration, provider: 'gpt', emitParticles: false }), signal: AbortSignal.timeout(300_000) });
+async function requestBakedAnimation(modelJson: unknown, description: string) {
+  const mode = /坐下|递交|交谈/.test(description) ? 'pro' : 'quick';
+  const response = await fetch(`${process.env.CG_MODEL_API_BASE ?? MODEL_API_BASE}/api/generate/animation`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ mode, modelJson, description, provider: 'gpt', emitParticles: false }), signal: AbortSignal.timeout(300_000) });
   const result = await response.json() as { ok?: boolean; baked?: unknown; error?: string; errorCode?: string };
   if (!response.ok || !result.ok || !result.baked) fail('animation_generation_failed', result.error ?? result.errorCode ?? '3d-generate 未返回可冻结的 baked 动画。');
   return result.baked;

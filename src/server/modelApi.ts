@@ -24,6 +24,8 @@ export interface ModelApiOptions {
   materialTags?: unknown | false;
   seeded?: boolean;
   seed?: number;
+  /** 3d-generate style references. The adapter removes refs without upstream AI metadata. */
+  refs?: Array<{ model: unknown; note?: string }>;
   fetchImpl?: typeof fetch;
   onStage?: (stage: Partial<ModelJobState>) => void;
   signal?: AbortSignal;
@@ -158,7 +160,12 @@ export async function generateModel(description: string, options: ModelApiOption
             seeded: true,
             ...(Number.isFinite(options.seed) ? { seed: Math.trunc(options.seed!) } : {})
           } : {}),
-          ...(materialTags ? { materialTags } : {})
+          ...(materialTags ? { materialTags } : {}),
+          ...(options.refs?.length ? {
+            refs: options.refs.slice(0, 3)
+              .filter(ref => hasAiMetadata(ref.model))
+              .map(ref => ({ model: ref.model, ...(ref.note?.trim() ? { note: ref.note.trim().slice(0, 40) } : {}) }))
+          } : {})
         }),
         signal: options.signal
       });
@@ -180,6 +187,10 @@ export async function generateModel(description: string, options: ModelApiOption
   }
 
   throw new Error(errors.join(' | ') || '所有模型 provider 均失败');
+}
+
+function hasAiMetadata(model: unknown): boolean {
+  return !!(model && typeof model === 'object' && (model as { _meta?: { ai?: unknown } })._meta?.ai);
 }
 
 export async function replayModel(

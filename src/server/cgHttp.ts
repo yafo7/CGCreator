@@ -9,13 +9,16 @@ import { CgHttpError, CgStore } from './cgStore';
 import type { MapStore } from './mapStore';
 import { queryWorld, validateWorldQuery, worldSummary } from '../shared/cgWorldQuery';
 import { buildWorldSemanticIndex } from '../shared/cgWorldSemantics';
+import { CgToolHost } from './cgToolHost';
 
 const services = new WeakMap<MapStore, CgService>();
+const toolHosts = new WeakMap<MapStore, CgToolHost>();
 export function cgServiceFor(mapStore: MapStore) {
   let service = services.get(mapStore);
   if (!service) { service = new CgService(new CgStore(path.join(mapStore.rootDir, 'cgcreator'))); services.set(mapStore, service); }
   return service;
 }
+function toolHostFor(mapStore: MapStore) { let host = toolHosts.get(mapStore); if (!host) { host = new CgToolHost(); toolHosts.set(mapStore, host); } return host; }
 
 /** Dedicated routes are handled before WorldForge routes; project storage never mutates source maps. */
 export async function handleCgHttp(req: http.IncomingMessage, res: http.ServerResponse, mapStore: MapStore): Promise<boolean> {
@@ -39,6 +42,7 @@ export async function handleCgHttp(req: http.IncomingMessage, res: http.ServerRe
     const parts = url.pathname.split('/').filter(Boolean);
     const service = cgServiceFor(mapStore);
     if (parts.length === 3 && parts[2] === 'capabilities' && req.method === 'GET') { send(200, CG_CAPABILITIES); return true; }
+    if (parts.length === 4 && parts[2] === 'tools' && parts[3] === '3d-editor' && req.method === 'POST') { send(200, { url: await toolHostFor(mapStore).open3dEditor() }); return true; }
     if (parts.length === 3 && parts[2] === 'foundation-demo' && req.method === 'POST') { send(201, await service.foundationDemo()); return true; }
     if (parts[2] !== 'projects') { send(404, { error: 'route_not_found' }); return true; }
     if (parts.length === 3 && req.method === 'GET') { send(200, { projects: await service.store.list() }); return true; }
@@ -60,6 +64,11 @@ export async function handleCgHttp(req: http.IncomingMessage, res: http.ServerRe
     if (parts.length === 5 && req.method === 'GET' && parts[4] === 'progress') {
       await service.store.read(id);
       send(200, service.progress.get(id) ?? { stage: 'idle', message: '等待操作', running: false });
+      return true;
+    }
+    if (parts.length === 5 && req.method === 'GET' && parts[4] === 'preparation') {
+      const project = await service.store.read(id);
+      send(200, project.preparation ?? { schemaVersion: 1, assets: [], versions: [], motions: [] });
       return true;
     }
     if (parts.length === 5 && req.method === 'GET' && parts[4] === 'export') {
@@ -89,6 +98,9 @@ export async function handleCgHttp(req: http.IncomingMessage, res: http.ServerRe
         send(200, await service.syncMap(id, revision, await hydrateMapAssets(map, mapStore), (body.scheme ?? null) as RenderScheme | null));
         break;
       }
+      case 'prepare-asset': send(200, await service.prepareAsset(id, revision, body)); break;
+      case 'prepare-motion': send(200, await service.prepareMotion(id, revision, body)); break;
+      case 'save-prepared-version': send(200, await service.savePreparedVersion(id, revision, body)); break;
       case 'plan': send(200, await service.plan(id, revision, body.prompt as string, body.demo === true)); break;
       case 'refine': send(200, await service.refine(id, revision, body.prompt as string, typeof body.targetId === 'string' ? body.targetId : undefined)); break;
       case 'patch': {

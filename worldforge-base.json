@@ -12,6 +12,7 @@
     "src/shared/network.ts": "Dedicated CGCreator API port",
     "src/client/mapEditor.ts": "Product branding, CG workspace launch, scene snapshot and input/render lifecycle",
     "src/server/index.ts": "CG route registration and product identity",
+    "src/server/modelApi.ts": "CG preparation adapter passes validated 3d-generate style references",
     "src/shared/modelBounds.ts": "Additive semantic camera landmarks; upstream geometry calculations unchanged",
     "tests/modelBounds.test.ts": "Semantic camera landmark regression",
     "tests/serverEndpoint.test.ts": "CGCreator API port expectations"

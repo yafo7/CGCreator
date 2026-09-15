@@ -3,6 +3,7 @@ import type { MapOperation } from './mapOperations';
 import type { RenderScheme } from './renderScheme';
 import type { WorldSemanticIndex } from './cgWorldSemantics';
 import type { CgPoseRig } from './cgPoseEvaluator';
+import type { CgPreparation } from './cgPreparation';
 
 export type CgVec3 = [number, number, number];
 export type CgQuat = [number, number, number, number];
@@ -250,6 +251,8 @@ export interface CgProject {
   schemeSnapshot: RenderScheme | null;
   document: DirectorDocument;
   resources: CgResources;
+  /** User-selected actors, props and immutable model versions prepared before directing. */
+  preparation?: CgPreparation;
   candidate: CompiledCG | null;
   confirmed: CompiledCG | null;
   mapSync?: CgMapSyncRecord;

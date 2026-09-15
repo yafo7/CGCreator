@@ -74,6 +74,7 @@ class CgWorkspace {
   private progressId = 0;
   private abort = new AbortController();
   private viewObservationKey = '';
+  private pendingPreparedAssetId = '';
 
   constructor(private options: CgWorkspaceOptions) {}
 
@@ -86,7 +87,7 @@ class CgWorkspace {
     this.root.innerHTML = `
       <header class="cg-header"><div class="cg-brand"><span class="cg-logo">C<span>G</span></span><div><strong>CGCreator</strong><small>实时 3D 演出工作台</small></div><span class="cg-version">V 0.2</span></div>
         <div class="cg-source"><span class="cg-status-dot"></span><span data-cg="source"></span><span class="cg-source-tag">WorldForge 快照</span></div>
-        <div class="cg-header-actions"><button data-do="import">导入演出</button><button data-do="export" disabled>导出已确认</button><button data-do="close" class="cg-close">返回地图 ↗</button></div>
+        <div class="cg-header-actions"><button data-do="open-3d-editor">3D 资产工坊</button><button data-do="import">导入演出</button><button data-do="export" disabled>导出已确认</button><button data-do="close" class="cg-close">返回地图 ↗</button></div>
       </header>
       <div class="cg-body">
         <aside class="cg-story"><div class="cg-panel-heading"><span>01 / 导演意图</span><span class="cg-muted">DIRECT</span></div>
@@ -97,6 +98,14 @@ class CgWorkspace {
           <button data-do="demo" class="cg-demo cg-full">体验内置演出 · 无需 AI 服务</button>
           <button data-do="foundation-demo" class="cg-demo cg-full">基础闭环演示 · 跑步、对话、坐下</button>
           <p class="cg-help">从当前地图开始。角色、道具和运镜被编译成可编辑的实时演出。</p>
+          <div class="cg-panel-heading cg-divider"><span>制作准备</span><span class="cg-muted">CAST & PROP</span></div>
+          <div class="cg-prep-form"><select data-cg="prep-kind" aria-label="资源类型"><option value="actor">角色</option><option value="prop">道具</option></select><input data-cg="prep-name" aria-label="资源名称" placeholder="名称，例如少年"></div>
+          <input data-cg="prep-description" aria-label="一句话资源描述" placeholder="穿蓝色短衫的少年">
+          <button data-do="prepare-asset" class="cg-full">＋ 制作角色或道具</button>
+          <p class="cg-help">用一句话描述。生成后可被导演直接选择；模型版本固定，后续替换不会覆盖已确认演出。</p>
+          <div class="cg-prep-form"><select data-cg="motion-asset" aria-label="动作所属资源"><option value="">先制作角色</option></select><input data-cg="motion-description" aria-label="一句话动作描述" placeholder="原地跑步"></div>
+          <button data-do="prepare-motion" class="cg-full">＋ 制作动作</button>
+          <div data-cg="preparation" class="cg-preparation"><div class="cg-empty">还没有准备角色或道具。</div></div>
           <div class="cg-panel-heading cg-divider"><span>镜头列表</span><span data-cg="shot-count" class="cg-muted">0 SHOTS</span></div>
           <div data-cg="shots" class="cg-shot-list"><div class="cg-empty">写下导演意图，或体验内置演出。镜头与动作将在这里展开。</div></div>
           <div class="cg-panel-heading cg-divider"><span>角色与资源</span><span data-cg="resource-count" class="cg-muted">0</span></div><div data-cg="entities" class="cg-entities"></div>
@@ -132,6 +141,7 @@ class CgWorkspace {
       <footer class="cg-footer"><div class="cg-pipeline"><span data-phase="document">导演文档</span><b>→</b><span data-phase="compile">Compile</span><b>→</b><span data-phase="validate">Validate</span><b>→</b><span data-phase="preview">Preview</span><b>→</b><span data-phase="confirm">Confirm</span></div><div class="cg-footer-actions"><button data-do="compile" disabled>编译并预览</button><button data-do="confirm" class="cg-primary" disabled>确认此版本</button></div></footer>
       <div data-cg="status" class="cg-status" role="status">当前地图已作为演出起点；源地图保持独立。</div><div data-cg="diagnostics" class="cg-diagnostics" hidden></div>
       <input type="file" data-cg="file" accept="application/json,.json" hidden>
+      <input type="file" data-cg="prepared-file" accept="application/json,.json" hidden>
     `;
     document.body.append(this.root);
     this.root.focus();
@@ -142,6 +152,7 @@ class CgWorkspace {
     this.el<HTMLSelectElement>('lock-target').addEventListener('change', () => this.syncButtons());
     this.el<HTMLInputElement>('world-filter').addEventListener('input', () => this.renderWorld());
     this.el<HTMLInputElement>('file').addEventListener('change', () => void this.importBundle());
+    this.el<HTMLInputElement>('prepared-file').addEventListener('change', () => void this.importPreparedModel());
     this.el<HTMLCanvasElement>('canvas').addEventListener('pointerdown', event => {
       if (this.pathEditing && this.runtime?.pickPathControl(event.clientX, event.clientY)) { event.stopPropagation(); return; }
       if (!this.marking || this.busy || !this.runtime) return;
@@ -252,6 +263,11 @@ class CgWorkspace {
     if (action === 'shot') { this.selectedBehavior = ''; this.selectedShot = button.dataset.id!; this.time = this.bundle?.shots.find(shot => shot.id === this.selectedShot)?.start ?? this.time; this.playing = false; this.renderDocument(); this.draw(); return; }
     if (action === 'behavior') { this.selectedBehavior = button.dataset.id!; this.selectedShot = ''; this.time = this.bundle?.actions.find(a => a.id === this.selectedBehavior)?.start ?? this.time; this.playing = false; this.renderDocument(); this.draw(); return; }
     if (action === 'import') { this.el<HTMLInputElement>('file').click(); return; }
+    if (action === 'open-3d-editor') { await this.run('正在打开 3d-generate 资产工坊…', async () => {
+      const { url } = await this.request<{ url: string }>('/tools/3d-editor', {});
+      window.open(url, '_blank', 'noopener');
+      this.status('3D 资产工坊已打开。编辑后导出模型 JSON，再在对应资源上点击「导入编辑结果」。');
+    }); return; }
     if (action === 'load') { await this.run('正在打开已保存的演出…', async () => {
       const id = this.el<HTMLSelectElement>('projects').value;
       if (!id) { await this.resetScene(this.options.map, this.options.scheme); this.project = null; this.selectedShot = ''; this.text('source', this.options.map.name); this.renderDocument(); this.status('已切换为新建项目；下一次生成将使用进入工作区时的地图快照。'); return; }
@@ -281,6 +297,37 @@ class CgWorkspace {
       await this.compile();
       await this.refreshProjects();
     }); return; }
+    if (action === 'prepare-asset') { await this.run('正在制作演出资源…', async () => {
+      const description = this.el<HTMLInputElement>('prep-description').value.trim();
+      if (!description) throw new Error('请用一句话描述角色或道具。');
+      if (!this.project) this.project = await this.request<CgProject>('/projects', { map: this.options.map, scheme: this.options.scheme, title: 'CG 制作准备' });
+      const project = await this.request<CgProject>(`/projects/${this.project.id}/prepare-asset`, {
+        revision: this.project.revision,
+        kind: this.el<HTMLSelectElement>('prep-kind').value,
+        name: this.el<HTMLInputElement>('prep-name').value.trim(),
+        description
+      });
+      await this.present(project, false);
+      this.el<HTMLInputElement>('prep-name').value = '';
+      this.el<HTMLInputElement>('prep-description').value = '';
+      this.status('资源已准备完成。导演生成时会优先使用它；模型编辑后将创建新版本。');
+      await this.refreshProjects();
+    }); return; }
+    if (action === 'prepare-motion') { await this.run('正在制作动作…', async () => {
+      if (!this.project) throw new Error('请先制作角色或道具。');
+      const assetId = this.el<HTMLSelectElement>('motion-asset').value;
+      const description = this.el<HTMLInputElement>('motion-description').value.trim();
+      if (!assetId || !description) throw new Error('请选择资源，并用一句话描述动作。');
+      await this.present(await this.request<CgProject>(`/projects/${this.project.id}/prepare-motion`, { revision: this.project.revision, assetId, description }), false);
+      this.el<HTMLInputElement>('motion-description').value = '';
+      this.status('动作已制作完成，并绑定到当前模型版本。导演可直接选择这个动作。');
+    }); return; }
+    if (action === 'edit-prepared') {
+      this.pendingPreparedAssetId = button.dataset.id ?? '';
+      if (!this.pendingPreparedAssetId) throw new Error('准备资源不存在。');
+      this.el<HTMLInputElement>('prepared-file').click();
+      return;
+    }
     if (action === 'compile') { await this.run('正在编译演出…', () => this.compile()); return; }
     if (action === 'refine') { await this.run('正在精修所选行为或镜头…', async () => {
       const prompt = this.el<HTMLTextAreaElement>('refine').value.trim();
@@ -391,6 +438,7 @@ class CgWorkspace {
     this.text('resource-count', String(this.project?.resources.models.length ?? this.bundle?.resources.models.length ?? 0));
     this.el('shots').innerHTML = doc?.shots.map((shot, index) => `<button data-do="shot" data-id="${escape(shot.id)}" class="cg-shot ${shot.id === this.selectedShot ? 'selected' : ''}"><span class="cg-shot-number">${String(index + 1).padStart(2, '0')}</span><span><strong>${escape(shot.name)}</strong><small>${escape(movement[shot.camera.movement])} · ${escape(framing[shot.camera.framing])}${shot.camera.view ? ` · ${escape(cameraView[shot.camera.view])}` : ''}</small></span><span class="cg-shot-duration">${seconds(this.effectiveDuration(shot.id))}s</span></button>`).join('') || '<div class="cg-empty">写下导演意图，或体验内置演出。镜头与动作将在这里展开。</div>';
     this.el('entities').innerHTML = doc?.entities.map(entity => `<div><span class="cg-entity-icon">${entity.kind === 'actor' ? '♙' : '◇'}</span><span><strong>${escape(entity.name)}</strong><small>${entity.objectId ? '绑定地图物体' : entity.assetId ? '演出资源' : '待解析资源'}</small></span></div>`).join('') ?? '';
+    this.renderPreparation();
     const shot = doc?.shots.find(value => value.id === this.selectedShot);
     this.el('selection').innerHTML = shot ? `<span class="cg-eyebrow">SHOT ${String((doc?.shots.indexOf(shot) ?? 0) + 1).padStart(2, '0')}</span><h2>${escape(shot.name)}</h2><p>${escape(shot.purpose)}</p><div class="cg-chips"><span>${escape(movement[shot.camera.movement])}</span><span>${escape(framing[shot.camera.framing])}</span>${shot.camera.view ? `<span>${escape(cameraView[shot.camera.view])}</span>` : ''}${shot.camera.aim ? `<span>${escape(cameraAim[shot.camera.aim])}</span>` : ''}<span>${seconds(this.effectiveDuration(shot.id))} 秒</span></div>` : '<h2>让意图成为演出</h2><p>选择镜头后，可以调整景别、节奏与机位。</p>';
     if (shot) this.el<HTMLInputElement>('duration').value = String(this.effectiveDuration(shot.id));
@@ -421,6 +469,21 @@ class CgWorkspace {
     return doc?.constraints.find(c => c.type === 'shot-duration' && c.targetId === id)?.seconds ?? (resolved ? resolved.end - resolved.start : doc?.shots.find(s => s.id === id)?.duration ?? 0);
   }
 
+  private renderPreparation(): void {
+    const preparation = this.project?.preparation;
+    this.el('preparation').innerHTML = preparation?.assets.length ? preparation.assets.map(asset => {
+      const version = preparation.versions.find(item => item.id === asset.selectedVersionId);
+      const capabilities = version ? [version.capabilities.locomotion ? '可移动' : '', version.capabilities.faceCloseup ? '可特写' : '', version.capabilities.sit === 'ready' ? '可坐下' : ''].filter(Boolean).join(' · ') : '';
+      return `<div class="cg-prepared-asset"><span class="cg-entity-icon">${asset.kind === 'actor' ? '♙' : '◇'}</span><span><strong>${escape(asset.name)}</strong><small>${escape(asset.description)}</small><small>v${asset.versionIds.length}${capabilities ? ` · ${escape(capabilities)}` : ''}</small></span><button data-do="edit-prepared" data-id="${escape(asset.id)}" title="从 3d-generate 导出的 JSON 创建新版本">导入编辑结果</button></div>`;
+    }).join('') : '<div class="cg-empty">还没有准备角色或道具。</div>';
+    const select = this.el<HTMLSelectElement>('motion-asset');
+    const previous = select.value;
+    select.innerHTML = '<option value="">选择角色或道具</option>' + (preparation?.assets ?? []).map(asset => `<option value="${escape(asset.id)}">${asset.kind === 'actor' ? '角色' : '道具'} · ${escape(asset.name)}</option>`).join('');
+    if ([...select.options].some(option => option.value === previous)) select.value = previous;
+    const motions = preparation?.motions ?? [];
+    if (motions.length) this.el('preparation').insertAdjacentHTML('beforeend', `<div class="cg-prepared-motions"><small>已准备动作</small>${motions.map(motion => `<span>${escape(motion.name)} · ${seconds(motion.naturalDuration)} 秒${motion.loop ? ' · 循环' : ''}</span>`).join('')}</div>`);
+  }
+
   private renderTimeline(): void {
     const bundle = this.bundle;
     if (!bundle) { this.el('tracks').innerHTML = '<div class="cg-timeline-empty">编译后，镜头和连续角色动作在这里对齐。</div>'; this.text('timeline-count', ''); return; }
@@ -432,7 +495,7 @@ class CgWorkspace {
 
   private syncButtons(): void {
     const hasDoc = !!this.project?.document.shots.length;
-    const allowed: Record<string, boolean> = { plan: !!this.runtime, demo: !!this.runtime, load: !!this.runtime, import: !!this.runtime, 'sync-map': this.mapSyncState === 'changed', manual: !!this.runtime, paths: !!this.bundle && !!this.project, mark: !!this.runtime, 'reset-view': !!this.runtime, refine: hasDoc && !!(this.selectedBehavior || this.selectedShot), compile: hasDoc, confirm: this.current && !!this.project?.candidate?.validation.valid && this.project.candidate.stage !== 'performance' && !this.manual && !this.marking && !this.pathEditing, export: !!this.project?.confirmed, play: !!this.bundle, start: !!this.bundle, 'lock-camera': hasDoc && !!this.selectedShot, 'lock-duration': hasDoc && !!this.selectedShot, 'lock-point': hasDoc && !!this.selectedPoint, 'lock-time': hasDoc && this.el<HTMLSelectElement>('lock-target').value.startsWith('action:'), 'remove-constraint': !!this.project };
+    const allowed: Record<string, boolean> = { plan: !!this.runtime, demo: !!this.runtime, load: !!this.runtime, import: !!this.runtime, 'open-3d-editor': !!this.runtime, 'prepare-asset': !!this.runtime, 'prepare-motion': !!this.project?.preparation?.assets.length, 'sync-map': this.mapSyncState === 'changed', manual: !!this.runtime, paths: !!this.bundle && !!this.project, mark: !!this.runtime, 'reset-view': !!this.runtime, refine: hasDoc && !!(this.selectedBehavior || this.selectedShot), compile: hasDoc, confirm: this.current && !!this.project?.candidate?.validation.valid && this.project.candidate.stage !== 'performance' && !this.manual && !this.marking && !this.pathEditing, export: !!this.project?.confirmed, play: !!this.bundle, start: !!this.bundle, 'lock-camera': hasDoc && !!this.selectedShot, 'lock-duration': hasDoc && !!this.selectedShot, 'lock-point': hasDoc && !!this.selectedPoint, 'lock-time': hasDoc && this.el<HTMLSelectElement>('lock-target').value.startsWith('action:'), 'remove-constraint': !!this.project };
     for (const button of this.root.querySelectorAll<HTMLButtonElement>('button[data-do]')) {
       const action = button.dataset.do!;
       if (action !== 'close') button.disabled = this.busy || allowed[action] === false;
@@ -563,6 +626,25 @@ class CgWorkspace {
       this.status('演出包已载入，可离线播放与拖动回看。需要继续编辑时，请打开本地保存的项目。');
     });
     this.el<HTMLInputElement>('file').value = '';
+  }
+
+  private async importPreparedModel(): Promise<void> {
+    const input = this.el<HTMLInputElement>('prepared-file');
+    const file = input.files?.[0], assetId = this.pendingPreparedAssetId;
+    input.value = '';
+    this.pendingPreparedAssetId = '';
+    if (!file || !assetId) return;
+    await this.run('正在保存编辑后的模型版本…', async () => {
+      if (!this.project) throw new Error('请先打开一个 CG 项目。');
+      if (file.size > 24 * 1024 * 1024) throw new Error('模型 JSON 超过 24 MB。');
+      const modelJson = JSON.parse(await file.text()) as unknown;
+      const asset = this.project.preparation?.assets.find(item => item.id === assetId);
+      if (!asset) throw new Error('准备资源不存在。');
+      await this.present(await this.request<CgProject>(`/projects/${this.project.id}/save-prepared-version`, {
+        revision: this.project.revision, assetId, modelJson, description: asset.description
+      }), false);
+      this.status('已保存为新的模型版本。相关演出需要重新编译和验证；已确认版本仍可回放。');
+    });
   }
 
   private download(value: unknown, name: string): void {
