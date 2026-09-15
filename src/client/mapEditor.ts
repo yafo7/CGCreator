@@ -170,8 +170,6 @@ import {
   type AgentProgressEvent,
   type ChatProvider
 } from '../shared/protocol';
-import { createEmptyDirectorReferences, type DirectorPlan } from '../shared/director';
-import { normalizeCinematic, type CinematicDocument } from '../shared/cinematic';
 import type { HdriTexture } from '../shared/hdri';
 import type { RenderScheme, RenderSuggestion } from '../shared/renderScheme';
 import {
@@ -231,7 +229,7 @@ import {
 
 type EditorTool = 'select' | 'paint' | 'terrain' | 'grass';
 type TransformMode = 'translate' | 'rotate' | 'scale';
-type EditorStage = 'map' | 'render' | 'director';
+type EditorStage = 'map' | 'render';
 type LightingReviewMode = 'final' | 'grayscale' | 'neutral-material' | 'no-post';
 type TerrainEditorAction = 'brush' | 'modifier' | 'surface' | 'road';
 
@@ -417,14 +415,6 @@ class MapEditor {
   private renderAiComparisonScheme: RenderScheme | null = null;
   private renderAiExplanation = '';
   private renderAiAbortController: AbortController | null = null;
-  private directorPrompt = '';
-  private directorProvider: ChatProvider = 'gpt';
-  private directorPlan: DirectorPlan | null = null;
-  private directorProjectId = 'local-worldforge';
-  private directorCinematicId = '';
-  private directorCinematicError = '';
-  private directorError = '';
-  private directorAbortController: AbortController | null = null;
   private renderAgentProgress: AgentProgressEvent[] = [];
   private renderAgentStartedAt = 0;
   private renderAgentElapsedMs = 0;
@@ -591,7 +581,7 @@ class MapEditor {
             <div class="stage-switcher segmented compact toolbar-workspace" aria-label="制作阶段">
               <button data-stage="map">地图</button>
               <button data-stage="render">渲染</button>
-              <button data-stage="director" title="用当前地图制作可编辑的实时 3D 演出">CG 导演</button>
+              <button id="open-cg-workspace" title="用当前地图制作可编辑的实时 3D 演出">CG 导演</button>
             </div>
             <div class="toolbar-group toolbar-tools" data-map-only>
               <span class="toolbar-label">工具</span>
@@ -693,7 +683,6 @@ class MapEditor {
           <div id="object-inspector"></div>
           <div id="asset-panel"></div>
           <div id="render-inspector"></div>
-          <div id="director-inspector"></div>
         </aside>
       </main>
       <dialog id="project-export-dialog" class="project-export-dialog">
@@ -926,6 +915,7 @@ class MapEditor {
       this.renderRenderInspector();
       this.updateToolbarState();
     });
+    this.app.querySelector('#open-cg-workspace')?.addEventListener('click', () => void this.openCgCreator());
     this.app.querySelectorAll<HTMLButtonElement>('[data-stage]').forEach((button) => {
       button.addEventListener('click', () => {
         const stage = button.dataset.stage as EditorStage;
@@ -1150,12 +1140,6 @@ class MapEditor {
     const savedMap = normalizeMap(map);
     const draftRecovery = await this.prepareBrowserMapDraftRecovery(savedMap);
     this.clearMapAiPreview();
-    this.directorAbortController?.abort();
-    this.directorAbortController = null;
-    this.directorPlan = null;
-    this.directorError = '';
-    this.directorCinematicId = '';
-    this.directorCinematicError = '';
     this.state.map = savedMap;
     this.state.undoTransaction = transaction;
     this.state.redoTransaction = redoTransaction;
@@ -1462,8 +1446,6 @@ class MapEditor {
     this.renderMapSelector();
     this.renderHierarchy();
     const mapStage = this.state.stage === 'map';
-    const renderStage = this.state.stage === 'render';
-    const directorStage = this.state.stage === 'director';
     const mapAiHost = this.app.querySelector<HTMLElement>('#map-ai-panel');
     if (mapAiHost) mapAiHost.hidden = !mapStage || this.mapPreviewKind === 'draft';
     const mapEditorHidden = !mapStage || Boolean(this.mapAiPreviewMap);
@@ -1472,9 +1454,7 @@ class MapEditor {
       if (host) host.hidden = mapEditorHidden;
     }
     const renderHost = this.app.querySelector<HTMLElement>('#render-inspector');
-    if (renderHost) renderHost.hidden = !renderStage;
-    const directorHost = this.app.querySelector<HTMLElement>('#director-inspector');
-    if (directorHost) directorHost.hidden = !directorStage;
+    if (renderHost) renderHost.hidden = mapStage;
     if (mapStage) {
       this.renderMapAiPanel();
       if (!this.mapAiPreviewMap) {
@@ -1482,17 +1462,15 @@ class MapEditor {
         this.renderObjectInspector();
         this.renderAssetPanel();
       }
-    } else if (renderStage) {
-      this.renderRenderInspector();
     } else {
-      this.renderDirectorInspector();
+      this.renderRenderInspector();
     }
     const heading = this.app.querySelector<HTMLElement>('.inspector-heading strong');
     const headingMode = this.app.querySelector<HTMLElement>('.inspector-heading small');
     if (heading) heading.textContent = mapStage
       ? this.mapAiPreviewMap ? '地图预览' : '属性'
-      : renderStage ? '渲染方案' : '导演 Agent';
-    if (headingMode) headingMode.textContent = mapStage ? 'MAP' : renderStage ? 'RENDER' : 'CG';
+      : '渲染方案';
+    if (headingMode) headingMode.textContent = mapStage ? 'MAP' : 'RENDER';
     this.attachSelectedTransform();
     this.updateToolbarState();
   }
@@ -5730,197 +5708,6 @@ class MapEditor {
     }
   }
 
-  private renderDirectorInspector(): void {
-    const host = this.app.querySelector<HTMLElement>('#director-inspector');
-    if (!host) return;
-    const map = this.state.map;
-    if (!map) {
-      host.innerHTML = '<section class="editor-section"><p class="empty">请先选择一个场景。</p></section>';
-      return;
-    }
-    const planning = Boolean(this.directorAbortController);
-    host.innerHTML = `
-      <section class="editor-section director-stage-summary">
-        <span class="stage-kicker">AI REAL-TIME DIRECTOR</span>
-        <h2>一句话生成 CG 策划</h2>
-        <p class="empty">先描述剧情和关键动作。导演 Agent 会读取当前场景，拆分镜头、机位、时长、演员走位和字幕；无法确定的位置与构图会列为标点或摄像机参考需求。</p>
-      </section>
-      <section class="editor-section director-ai">
-        <label><span>演出描述</span><textarea id="director-prompt" maxlength="4000" placeholder="例如：三只鸭在主街奔跑，镜头从街口跟拍；其中一只变成长椅躲到路灯旁，最后猎鸭教官从海滩方向追来。">${escapeHtml(this.directorPrompt)}</textarea></label>
-        <div class="director-ai-actions">
-          <label><span>项目标识</span><input id="director-project" maxlength="80" value="${escapeHtml(this.directorProjectId)}" placeholder="mandeya" /></label>
-          <label><span>导演模型</span><select id="director-provider"><option value="gpt" ${this.directorProvider === 'gpt' ? 'selected' : ''}>GPT</option></select></label>
-          <button id="director-generate" type="button" ${planning || !this.directorPrompt.trim() ? 'disabled' : ''}>${planning ? '正在策划…' : '生成 CG 策划'}</button>
-          <button id="director-save" type="button" ${planning || !this.directorPlan ? 'disabled' : ''}>保存 CG 草稿</button>
-          <button id="director-load" type="button" ${planning ? 'disabled' : ''}>读取最近 CG</button>
-        </div>
-        ${planning ? '<div class="agent-run"><strong>导演 Agent 正在工作</strong><small>正在结合地图对象、场景尺度和剧情描述生成结构化镜头表。</small></div>' : ''}
-        ${this.directorError ? `<p class="director-error">${escapeHtml(this.directorError)}</p>` : ''}
-        ${this.directorCinematicError ? `<p class="director-error">${escapeHtml(this.directorCinematicError)}</p>` : ''}
-        ${this.directorCinematicId ? `<p class="empty">当前 CG：${escapeHtml(this.directorCinematicId)}</p>` : ''}
-      </section>
-      ${this.directorPlan ? this.renderDirectorPlanHtml(this.directorPlan) : `
-        <section class="editor-section director-empty">
-          <h3>输出内容</h3>
-          <p class="empty">生成后会在这里显示演员表、镜头顺序、焦段、机位、动作走位、字幕和下一步需要补充的空间参考。</p>
-        </section>
-      `}
-    `;
-    host.querySelector<HTMLTextAreaElement>('#director-prompt')?.addEventListener('input', (event) => {
-      this.directorPrompt = (event.target as HTMLTextAreaElement).value;
-      const button = host.querySelector<HTMLButtonElement>('#director-generate');
-      if (button) button.disabled = planning || !this.directorPrompt.trim();
-    });
-    host.querySelector<HTMLInputElement>('#director-project')?.addEventListener('input', (event) => {
-      const value = (event.target as HTMLInputElement).value.trim();
-      this.directorProjectId = value || 'local-worldforge';
-    });
-    host.querySelector<HTMLSelectElement>('#director-provider')?.addEventListener('change', (event) => {
-      this.directorProvider = (event.target as HTMLSelectElement).value as ChatProvider;
-    });
-    host.querySelector<HTMLButtonElement>('#director-generate')?.addEventListener('click', () => {
-      void this.generateDirectorDraft();
-    });
-    host.querySelector<HTMLButtonElement>('#director-save')?.addEventListener('click', () => {
-      void this.saveDirectorCinematic();
-    });
-    host.querySelector<HTMLButtonElement>('#director-load')?.addEventListener('click', () => {
-      void this.loadRecentDirectorCinematic();
-    });
-  }
-
-  private renderDirectorPlanHtml(plan: DirectorPlan): string {
-    const cast = plan.cast.length > 0
-      ? `<div class="style-tags">${plan.cast.map((member) => `<span>${escapeHtml(member.name)} · ${escapeHtml(member.role)}</span>`).join('')}</div>`
-      : '<p class="empty">当前策划没有声明演员。</p>';
-    const shots = plan.shots.map((shot) => `
-      <article class="director-shot-card">
-        <header><span>${String(shot.order).padStart(2, '0')}</span><div><strong>${escapeHtml(shot.title)}</strong><small>${shot.durationSeconds} 秒 · ${escapeHtml(directorCameraLabel(shot.camera))}</small></div></header>
-        <p>${escapeHtml(shot.purpose || shot.action)}</p>
-        <dl>
-          <div><dt>地点</dt><dd>${escapeHtml(shot.location)}</dd></div>
-          <div><dt>机位</dt><dd>${escapeHtml(shot.camera.direction || shot.camera.subject)}</dd></div>
-          <div><dt>动作</dt><dd>${escapeHtml(shot.action || '保持场景状态')}</dd></div>
-          ${shot.blocking.map((beat) => `<div><dt>${escapeHtml(beat.actorId)}</dt><dd>${escapeHtml(`${beat.from}${beat.via.length ? ` → ${beat.via.join(' → ')}` : ''} → ${beat.to}；${beat.action}`)}</dd></div>`).join('')}
-          ${shot.dialogue ? `<div><dt>对白</dt><dd>${escapeHtml(shot.dialogue)}</dd></div>` : ''}
-          ${shot.subtitle ? `<div><dt>字幕</dt><dd>${escapeHtml(shot.subtitle)}</dd></div>` : ''}
-        </dl>
-      </article>
-    `).join('');
-    const references = plan.referenceNeeds.length > 0
-      ? `<section class="editor-section director-reference-needs"><h3>下一步需要的参考</h3>${plan.referenceNeeds.map((need) => `<div><strong>${escapeHtml(directorReferenceLabel(need.kind))} · ${escapeHtml(need.label)}</strong><p>${escapeHtml(need.reason)}</p></div>`).join('')}</section>`
-      : '';
-    return `
-      <section class="editor-section director-plan-summary">
-        <span class="stage-kicker">DIRECTOR DRAFT</span>
-        <h2>${escapeHtml(plan.title)}</h2>
-        <p>${escapeHtml(plan.logline)}</p>
-        <div class="map-ai-stats"><span>${plan.shots.length} 个镜头</span><span>约 ${plan.estimatedDurationSeconds} 秒</span><span>${plan.cast.length} 名演员</span></div>
-        ${cast}
-      </section>
-      <section class="editor-section director-shot-list"><h3>镜头策划</h3>${shots}</section>
-      ${references}
-      ${plan.assumptions.length ? `<section class="editor-section"><h3>临时假设</h3><ul class="director-assumptions">${plan.assumptions.map((item) => `<li>${escapeHtml(item)}</li>`).join('')}</ul></section>` : ''}
-    `;
-  }
-
-  private async generateDirectorDraft(): Promise<void> {
-    const map = this.state.map;
-    const prompt = this.directorPrompt.trim();
-    if (!map || !prompt || this.directorAbortController) return;
-    const controller = new AbortController();
-    this.directorAbortController = controller;
-    this.directorError = '';
-    this.directorPlan = null;
-    this.setBusy(true, '导演 Agent 正在策划 CG...');
-    this.renderDirectorInspector();
-    try {
-      const { plan } = await editorFetch<{ plan: DirectorPlan }>(
-        `/api/editor/maps/${encodeURIComponent(map.id)}/director/plan`,
-        {
-          method: 'POST',
-          body: JSON.stringify({
-            prompt,
-            provider: this.directorProvider,
-            references: { markers: [], cameras: [], screenshots: [] }
-          }),
-          signal: controller.signal
-        }
-      );
-      this.directorPlan = plan;
-      this.directorCinematicId = '';
-      this.directorCinematicError = '';
-      this.state.message = `CG 策划已生成：${plan.shots.length} 个镜头，约 ${plan.estimatedDurationSeconds} 秒`;
-    } catch (error) {
-      if (controller.signal.aborted) return;
-      this.directorError = directorAgentError(error);
-      this.state.message = 'CG 策划生成失败';
-    } finally {
-      if (this.directorAbortController === controller) this.directorAbortController = null;
-      this.setBusy(false);
-      this.renderDirectorInspector();
-    }
-  }
-
-  private async saveDirectorCinematic(): Promise<void> {
-    const map = this.state.map;
-    const plan = this.directorPlan;
-    if (!map || !plan || this.directorAbortController) return;
-    this.directorCinematicError = '';
-    try {
-      const document = normalizeCinematic({
-        id: this.directorCinematicId || undefined,
-        projectId: this.directorProjectId || 'local-worldforge',
-        mapId: map.id,
-        mapVersion: map.version,
-        title: plan.title,
-        status: 'draft',
-        sourcePrompt: this.directorPrompt.trim() || plan.sourcePrompt,
-        references: createEmptyDirectorReferences(),
-        bindings: { actors: [], props: [] },
-        directorPlan: plan,
-        compiledRuntime: null,
-        createdAt: Date.now(),
-        updatedAt: Date.now()
-      });
-      const result = await editorFetch<{ cinematic: CinematicDocument }>('/api/editor/cinematics', {
-        method: 'POST',
-        body: JSON.stringify({ projectId: this.directorProjectId, cinematic: document })
-      });
-      this.directorCinematicId = result.cinematic.id;
-      this.state.message = `CG 草稿已保存：${result.cinematic.title}`;
-    } catch (error) {
-      this.directorCinematicError = error instanceof Error ? error.message : String(error);
-      this.state.message = 'CG 草稿保存失败';
-    }
-    this.renderDirectorInspector();
-  }
-
-  private async loadRecentDirectorCinematic(): Promise<void> {
-    const map = this.state.map;
-    if (!map || this.directorAbortController) return;
-    this.directorCinematicError = '';
-    try {
-      const list = await editorFetch<{ cinematics: Array<{ id: string; projectId: string; mapId: string; stale: boolean }> }>(
-        `/api/editor/cinematics?projectId=${encodeURIComponent(this.directorProjectId || 'local-worldforge')}`
-      );
-      const latest = list.cinematics.find((item) => item.mapId === map.id && !item.stale) ?? list.cinematics.find((item) => item.mapId === map.id);
-      if (!latest) throw new Error('没有找到当前地图的 CG 草稿');
-      const result = await editorFetch<{ cinematic: CinematicDocument; summary: { stale: boolean } | null }>(
-        `/api/editor/cinematics/${encodeURIComponent(latest.projectId)}/${encodeURIComponent(latest.id)}`
-      );
-      this.directorPlan = result.cinematic.directorPlan;
-      this.directorPrompt = result.cinematic.sourcePrompt;
-      this.directorCinematicId = result.cinematic.id;
-      if (result.summary?.stale) this.directorCinematicError = '该 CG 绑定的地图版本已变化，请重新确认标点和摄像机。';
-      this.state.message = `已读取 CG：${result.cinematic.title}`;
-    } catch (error) {
-      this.directorCinematicError = error instanceof Error ? error.message : String(error);
-      this.state.message = 'CG 草稿读取失败';
-    }
-    this.renderDirectorInspector();
-  }
-
   private async confirmMap(): Promise<void> {
     if (!this.state.map || this.state.busy || this.mapAiPreviewMap) return;
     if (this.state.map.confirmedAt && !this.state.dirty) {
@@ -5957,10 +5744,6 @@ class MapEditor {
       this.updateToolbarState();
       return;
     }
-    if (stage === 'director') {
-      void this.openCgCreator();
-      return;
-    }
     if (stage === 'render' && !this.state.map?.confirmedAt) {
       this.state.message = '请先确认地图，再进入渲染阶段';
       this.updateToolbarState();
@@ -5983,12 +5766,12 @@ class MapEditor {
 
   private async openCgCreator(): Promise<void> {
     if (this.cgWorkspaceOpen || !this.state.map) return;
-    if (this.state.busy) {
-      this.state.message = '请等待当前地图操作完成，再打开 CG 导演';
+    if (this.state.busy || this.mapAiPreviewMap) {
+      this.state.message = '请先完成当前地图操作，并应用或放弃地图预览，再打开 CG 导演';
       this.updateToolbarState();
       return;
     }
-    // Capture the same map/assets and render scheme that are currently visible.
+    // Freeze the visible map and scheme; CG edits do not change the source map.
     const map = structuredClone(this.mapWithEditorAssets());
     const scheme = structuredClone(this.visibleRenderScheme());
     this.cgWorkspaceOpen = true;
@@ -6735,19 +6518,20 @@ class MapEditor {
   }
 
   private updateToolbarState(): void {
+    const cgButton = this.app.querySelector<HTMLButtonElement>('#open-cg-workspace');
+    if (cgButton) cgButton.disabled = this.state.busy || !this.state.map || Boolean(this.mapAiPreviewMap);
     const mapStage = this.state.stage === 'map';
-    const renderStage = this.state.stage === 'render';
     this.app.dataset.stage = this.state.stage;
     this.app.querySelectorAll<HTMLElement>('[data-map-only]').forEach((element) => {
       element.hidden = !mapStage;
     });
     this.app.querySelectorAll<HTMLElement>('[data-render-only]').forEach((element) => {
-      element.hidden = !renderStage;
+      element.hidden = mapStage;
     });
     this.app.querySelectorAll<HTMLButtonElement>('[data-stage]').forEach((button) => {
       const stage = button.dataset.stage as EditorStage;
       button.classList.toggle('active', stage === this.state.stage);
-      button.disabled = this.state.busy || Boolean(this.mapAiPreviewMap) || (stage !== 'map' && !this.state.map);
+      button.disabled = this.state.busy || Boolean(this.mapAiPreviewMap) || (stage === 'render' && !this.state.map);
     });
     this.app.querySelectorAll<HTMLButtonElement>('[data-tool]').forEach((button) => {
       button.classList.toggle('active', button.dataset.tool === this.state.tool);
@@ -8058,39 +7842,6 @@ async function extractPaletteColorsFromImage(file: File, maxColors: number): Pro
   } finally {
     bitmap.close();
   }
-}
-
-function directorCameraLabel(camera: DirectorPlan['shots'][number]['camera']): string {
-  const height = { aerial: '高空', high: '高机位', 'eye-level': '角色眼高', low: '低机位' }[camera.height];
-  const framing = {
-    'extreme-wide': '大远景',
-    wide: '全景',
-    medium: '中景',
-    'close-up': '近景',
-    'over-shoulder': '过肩',
-    pov: '主观视角'
-  }[camera.framing];
-  const movement = {
-    static: '固定', pan: '横摇', tilt: '俯仰', dolly: '推拉', tracking: '跟拍',
-    orbit: '环绕', crane: '升降', handheld: '手持', cut: '切镜'
-  }[camera.movement];
-  return `${height} · ${framing} · ${movement} · ${camera.lensMm}mm`;
-}
-
-function directorReferenceLabel(kind: DirectorPlan['referenceNeeds'][number]['kind']): string {
-  return { marker: '空间标点', camera: '摄像机点位', screenshot: '场景截图' }[kind];
-}
-
-function directorAgentError(error: unknown): string {
-  const message = error instanceof Error ? error.message : String(error);
-  const known: Array<[string, string]> = [
-    ['missing_director_prompt', '请先输入演出描述'],
-    ['provider_unavailable', '当前导演模型不可用'],
-    ['director_plan_requires_shots', '模型没有生成有效镜头，请补充剧情后重试'],
-    ['invalid_director_plan', '模型返回的导演策划格式无效'],
-    ['chat_service_unreachable', '暂时无法连接导演模型服务']
-  ];
-  return known.find(([code]) => message.includes(code))?.[1] ?? message;
 }
 
 function escapeHtml(value: string): string {

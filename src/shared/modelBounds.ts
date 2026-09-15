@@ -118,6 +118,18 @@ export function calculateModelVisualBounds(modelJson: unknown): Aabb {
   return cloneBounds(normalizeLikeClient(rawBounds ?? FALLBACK_BOUNDS));
 }
 
+/** Additive CG adapter. Uses the existing geometry vocabulary without changing
+ * WorldForge bounds or rendering. Local boxes are conservative for non-box meshes. */
+export function modelSpatialNodes(modelJson: unknown) {
+  const data = modelJson as ModelJson;
+  const nodes = Array.isArray(data?.nodes) ? data.nodes : [];
+  return nodes.filter((node): node is ModelNode & { id: string } => typeof node.id === 'string').map(node => ({
+    id: node.id, name: node.name ?? node.id, parent: node.parent,
+    position: localTransform(node).pos, quaternion: localTransform(node).quat, scale: localTransform(node).scale,
+    ...(node.mesh ? { bounds: localMeshBounds(node.mesh.type ?? 'box', node.mesh.params ?? {}), geometry: node.mesh.type ?? 'box' } : {})
+  }));
+}
+
 /**
  * Extracts camera landmarks from named head/face/eye nodes and their mesh descendants.
  * Generated assets without semantic names receive conservative human-proportion fallbacks.

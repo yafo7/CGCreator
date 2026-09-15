@@ -4,13 +4,15 @@ import os from 'node:os';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createEmptyMap, createMapObject } from '../src/shared/map';
+import { buildModelColliderPlan } from '../src/shared/modelBounds';
 import { evaluateCG, stableHash } from '../src/shared/cgCompiler';
 import type { CgClip, CgProject, DirectorDocument } from '../src/shared/cgTypes';
 import { BUILTIN_RENDER_SCHEMES } from '../src/shared/renderScheme';
-import { CgService, buildSemanticContext, decodeBakedClip } from '../src/server/cgService';
+import { CgService, buildSemanticContext, decodeBakedClip, summarizeMapSync } from '../src/server/cgService';
 import { CgStore } from '../src/server/cgStore';
 import { cgServiceFor, handleCgHttp } from '../src/server/cgHttp';
 import { MapStore } from '../src/server/mapStore';
+import { handleMapHttp } from '../src/server/mapHttp';
 import type { ChatMessage } from '../src/server/modelApi';
 
 let root: string;
@@ -139,6 +141,127 @@ describe('CG project storage and compile lifecycle', () => {
 });
 
 describe('CG planning, refine and resource resolution', () => {
+  it('chooses coverage only after actual V2 performance validation and does not repeat AI on recompile', async () => {
+    const chat = vi.fn(async (messages: ChatMessage[]) => {
+      const input = JSON.parse(messages.at(-1)!.content as string);
+      if (input.performance) {
+        expect(input.performance.occupancy).toHaveLength(1);
+        expect(input.performance.behaviors.find((b: { id: string }) => b.id === 'sit').contact.nodeId).toBe('seat');
+        expect(input.shotSkills.some((s: { id: string }) => s.id === 'dialogue-two')).toBe(true);
+        return '[]';
+      }
+      return JSON.stringify({ ...input.existingDocument, ...input.documentIdentity, shots: [] });
+    });
+    const service = new CgService(new CgStore(root), { chat });
+    let project = await service.foundationDemo();
+    project = await service.plan(project.id, project.revision, '先完成行为，再选择镜头');
+    expect(project.coveragePending).toBe(true);
+    project = await service.compile(project.id, project.revision);
+    expect(project.coveragePending).toBe(false);
+    expect(project.candidate?.stage).toBe('complete');
+    expect(project.candidate?.validation.valid).toBe(true);
+    expect(chat).toHaveBeenCalledTimes(2);
+    await service.compile(project.id, project.revision);
+    expect(chat).toHaveBeenCalledTimes(2);
+  }, 15000);
+
+  it('never asks for cameras when the performance is invalid and preserves confirmation', async () => {
+    const chat = vi.fn(async (messages: ChatMessage[]) => {
+      const input = JSON.parse(messages.at(-1)!.content as string);
+      return JSON.stringify({ ...input.existingDocument, ...input.documentIdentity, shots: [] });
+    });
+    const service = new CgService(new CgStore(root), { chat });
+    let project = await service.foundationDemo();
+    project = await service.confirm(project.id, project.revision, project.candidate!.id, project.candidate!.inputHash);
+    const confirmed = structuredClone(project.confirmed);
+    project = await service.plan(project.id, project.revision, '准备行为');
+    const changedMap = structuredClone(project.mapSnapshot); changedMap.guides = [];
+    project = (await service.syncMap(project.id, project.revision, changedMap, null)).project;
+    project = await service.compile(project.id, project.revision);
+    expect(project.candidate?.stage).toBe('performance');
+    expect(project.candidate?.validation.valid).toBe(false);
+    expect(project.confirmed).toEqual(confirmed);
+    expect(chat).toHaveBeenCalledTimes(1);
+    await expect(service.confirm(project.id, project.revision, project.candidate!.id, project.candidate!.inputHash)).rejects.toMatchObject({ code: 'incomplete_compile' });
+  });
+
+  it('rejects a coverage response that attempts to change actor behavior', async () => {
+    const chat = vi.fn(async (messages: ChatMessage[]) => {
+      const input = JSON.parse(messages.at(-1)!.content as string);
+      return input.performance ? JSON.stringify([{ type: 'action.update', id: 'run', patch: { duration: 20 } }]) : JSON.stringify({ ...input.existingDocument, ...input.documentIdentity, shots: [] });
+    });
+    const service = new CgService(new CgStore(root), { chat });
+    let project = await service.foundationDemo();
+    project = await service.plan(project.id, project.revision, '保持行为');
+    const before = structuredClone(project.document);
+    await expect(service.compile(project.id, project.revision)).rejects.toMatchObject({ code: 'invalid_coverage' });
+    expect((await service.store.read(project.id)).document).toEqual(before);
+  });
+
+  it('lets the director query exact current regions before returning its validated document', async () => {
+    let initial: ChatMessage[] = [];
+    const chat = vi.fn(async (messages: ChatMessage[]) => {
+      if (!initial.length) {
+        initial = structuredClone(messages);
+        expect(JSON.parse(messages[1].content as string).map.worldUnderstanding.regions).toEqual(expect.arrayContaining([expect.objectContaining({ id: 'zone:pond' })]));
+        return JSON.stringify({ worldQueries: [{ type: 'inspect', semanticId: 'zone:pond' }, { type: 'point', position: [5, 5] }] });
+      }
+      const result = JSON.parse(messages[messages.length - 1].content as string);
+      expect(result.worldQueryResults[0].entity.spatial.shape).toEqual({ kind: 'circle', x: 5, z: 5, radius: 2 });
+      expect(result.worldQueryResults[1].matches).toEqual(expect.arrayContaining([expect.objectContaining({ id: 'zone:pond' })]));
+      expect(result.worldQueryResults[0].sourceHash).toBe(result.worldQueryResults[1].sourceHash);
+      return JSON.stringify(planFromContext(initial));
+    });
+    const service = new CgService(new CgStore(root), { chat });
+    const map = mapFixture(); map.visualSemantics.zones.push({ id: 'pond', center: [5, 5], radius: 2, tags: ['water'], intensity: 1 });
+    const created = await service.create(map, null);
+    const planned = await service.plan(created.id, created.revision, '沿池塘行走');
+    expect(chat).toHaveBeenCalledTimes(2);
+    expect(planned.document.shots).toHaveLength(2);
+    expect(planned.mapSnapshot).toEqual(map);
+  });
+
+  it('bounds director world queries and preserves the project after query exhaustion', async () => {
+    const chat = vi.fn(async () => JSON.stringify({ worldQueries: [{ type: 'summary' }] }));
+    const service = new CgService(new CgStore(root), { chat });
+    const created = await service.create(mapFixture(), null);
+    await expect(service.plan(created.id, created.revision, '查看地图')).rejects.toMatchObject({ code: 'world_query_limit' });
+    expect(chat).toHaveBeenCalledTimes(4);
+    expect(await service.store.read(created.id)).toEqual(created);
+  });
+
+  it('sends placed spatial semantics while deduplicating repeated asset hierarchies', () => {
+    const map = mapFixture();
+    const modelJson = {
+      nodes: [
+        { id: 'trunk', name: '树干', transform: { pos: [0, 1, 0] }, tags: ['wood'] },
+        { id: 'canopy', name: '树冠', parent: 'trunk', transform: { pos: [0, 2, 0] }, tags: ['foliage'] }
+      ],
+      _meta: { semanticSnapshot: { text: '一棵由树干和树冠组成的园林树。' } }
+    };
+    map.assets = [{
+      id: 'garden-tree', name: '园林树', prompt: '中式园林中的树', tags: ['tree'], modelJson,
+      colliderPlan: buildModelColliderPlan(modelJson), mode: 'json', createdAt: 1, updatedAt: 1
+    }];
+    const first = createMapObject('东侧园林树', 'garden-tree'); first.id = 'tree-east'; first.transform.position = [4, 0, 0];
+    const second = createMapObject('西侧园林树', 'garden-tree'); second.id = 'tree-west'; second.transform.position = [-4, 0, 0];
+    map.objects.push(first, second);
+
+    const context = buildSemanticContext(map);
+    expect(context.semanticIndex.spatialEntities.filter((entity) => entity.kind === 'object')).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: 'object:tree-east', assetId: 'garden-tree', worldPosition: [4, 0, 0] }),
+      expect.objectContaining({ id: 'object:tree-west', assetId: 'garden-tree', worldPosition: [-4, 0, 0] })
+    ]));
+    expect(context.semanticIndex.spatialEntities.some((entity) => entity.kind === 'model-part')).toBe(false);
+    expect(context.semanticIndex.assetHierarchies).toEqual([expect.objectContaining({
+      assetId: 'garden-tree', semanticSummary: '一棵由树干和树冠组成的园林树。',
+      nodes: [
+        expect.objectContaining({ id: 'trunk', name: '树干' }),
+        expect.objectContaining({ id: 'canopy', name: '树冠', parent: 'trunk' })
+      ]
+    })]);
+  });
+
   it('makes a local scoped camera edit without AI or changing independent action hashes', async () => {
     const chat = vi.fn(async () => { throw new Error('No remote call expected'); });
     const { service, project } = await demo(new CgService(new CgStore(root), { chat }));
@@ -265,12 +388,145 @@ describe('CG HTTP API', () => {
   let mapStore: MapStore;
   beforeEach(async () => {
     mapStore = new MapStore({ rootDir: path.join(root, 'maps'), starterDataDir: null });
-    server = http.createServer((req, res) => { void handleCgHttp(req, res, mapStore).then((handled) => { if (!handled) { res.writeHead(404); res.end(); } }); });
+    server = http.createServer((req, res) => {
+      void (async () => {
+        if (await handleCgHttp(req, res, mapStore)) return;
+        if (await handleMapHttp(req, res, mapStore)) return;
+        res.writeHead(404); res.end();
+      })().catch(() => { res.writeHead(500); res.end(); });
+    });
     await new Promise<void>((resolve) => { server.listen(0, '127.0.0.1', resolve); });
     base = `http://127.0.0.1:${(server.address() as { port: number }).port}/api/cg`;
   });
   afterEach(async () => { await new Promise<void>((resolve, reject) => { server.close((error) => error ? reject(error) : resolve()); server.closeAllConnections(); }); });
   const post = async (url: string, body: unknown) => fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json', Origin: 'http://localhost:5182' }, body: JSON.stringify(body) });
+
+  it('exposes the standalone foundation demo through the complete confirm/export/reopen protocol', async () => {
+    const created = await post(`${base}/foundation-demo`, {});
+    expect(created.status).toBe(201);
+    const project: CgProject = await created.json();
+    expect(project.document.schemaVersion).toBe(2);
+    expect(project.candidate?.validation.valid).toBe(true);
+    expect(evaluateCG(project.candidate!, 13).entities.boy.posture).toBe('seated');
+    expect(project.confirmed).toBeNull();
+    const confirmed = await post(`${base}/projects/${project.id}/confirm`, { revision: project.revision, compileId: project.candidate!.id, inputHash: project.candidate!.inputHash });
+    expect(confirmed.status).toBe(200);
+    const exported = await (await fetch(`${base}/projects/${project.id}/export`)).json();
+    expect(exported.performance.occupancy).toHaveLength(1);
+    const reopened = await (await fetch(`${base}/projects/${project.id}`)).json();
+    expect(reopened.confirmed.id).toBe(exported.id);
+  });
+
+  it('serves read-only world queries and rejects stale geometry after map synchronization', async () => {
+    const map = mapFixture(); map.visualSemantics.zones.push({ id: 'stage', center: [5, 5], radius: 2, tags: ['clear'], intensity: 1 });
+    const project: CgProject = await (await post(`${base}/projects`, { map })).json();
+    const url = `${base}/projects/${project.id}`;
+    const world = await (await fetch(`${url}/world`)).json();
+    expect(world.regions).toEqual(expect.arrayContaining([expect.objectContaining({ id: 'zone:stage' })]));
+    const query = { revision: project.revision, sourceHash: world.sourceHash, query: { type: 'point', position: [5, 5] } };
+    const response = await post(`${url}/world-query`, query);
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ matches: expect.arrayContaining([expect.objectContaining({ id: 'zone:stage' })]) });
+    expect(await (await fetch(url)).json()).toEqual(project);
+    expect((await post(`${url}/world-query`, { ...query, query: { type: 'point', position: [1] } })).status).toBe(400);
+    map.visualSemantics.zones[0].center = [-5, -5];
+    const sync = await (await post(`${url}/sync-map`, { revision: project.revision, map })).json();
+    expect((await post(`${url}/world-query`, query)).status).toBe(409);
+    expect((await post(`${url}/world-query`, { ...query, revision: sync.project.revision })).status).toBe(409);
+    const next = await (await fetch(`${url}/world`)).json();
+    expect(next.sourceHash).not.toBe(world.sourceHash);
+    expect(next.regions.find((r: { id: string }) => r.id === 'zone:stage').spatial.shape).toMatchObject({ x: -5, z: -5 });
+  });
+
+  it('keeps WorldForge transactions isolated from CG projects and rejects retired director routes', async () => {
+    const editor = base.replace('/api/cg', '/api/editor');
+    const created = await post(`${editor}/maps`, { name: 'Independent WorldForge map', size: [24, 10, 24] });
+    expect(created.status).toBe(201);
+    const { map } = await created.json();
+    const object = createMapObject('Stage marker');
+    const transaction = await post(`${editor}/maps/${map.id}/transactions`, {
+      source: 'manual', label: 'Place marker', operations: [{ type: 'object.add', object }]
+    });
+    expect(transaction.status).toBe(200);
+    const source = await (await fetch(`${editor}/maps/${map.id}`)).json();
+    expect(source.map.objects).toHaveLength(1);
+    const response = await post(`${base}/projects`, { map: source.map, scheme: null });
+    expect(response.status).toBe(201);
+    const project: CgProject = await response.json();
+    const planned = await post(`${base}/projects/${project.id}/plan`, { revision: project.revision, prompt: '离线演示', demo: true });
+    expect(planned.status).toBe(200);
+    expect((await planned.json()).document.shots.length).toBeGreaterThan(0);
+    expect(await (await fetch(`${editor}/maps/${map.id}`)).json()).toEqual(source);
+    const capabilities = await (await fetch(`${base}/capabilities`)).json();
+    expect(capabilities.constraints).toEqual(expect.arrayContaining(['action-route', 'camera-path']));
+    for (const response of [
+      await fetch(`${editor}/cinematics`),
+      await post(`${editor}/cinematics`, {}),
+      await post(`${editor}/maps/${map.id}/director/plan`, { prompt: 'Retired endpoint must not invoke AI' })
+    ]) {
+      expect(response.status).toBe(404);
+      expect(await response.json()).toMatchObject({ error: 'not_found' });
+    }
+    expect(await readdir(path.join(root, 'maps'))).not.toContain('cinematics');
+  });
+
+  it('syncs a newer WorldForge snapshot while preserving director intent, hard constraints, resources and confirmation', async () => {
+    const setup = await demo(), service = setup.service;
+    let project = await service.confirm(setup.project.id, setup.project.revision, setup.project.candidate!.id, setup.project.candidate!.inputHash);
+    project = await service.patch(project.id, project.revision, [{ type: 'constraint.upsert', constraint: { id: 'fixed-opening', source: 'user', strength: 'hard', type: 'shot-duration', targetId: 'demo_shot_wide', seconds: 6 } }]);
+    const before = structuredClone(project);
+    const map = structuredClone(project.mapSnapshot);
+    const prop = createMapObject('New pavilion prop'); prop.id = 'new-prop'; prop.transform.position = [3, 0, -2];
+    map.objects.push(prop);
+    map.terrain.heights[0] += 0.5;
+    map.version += 1;
+    map.updatedAt += 1000;
+    const scheme = structuredClone(BUILTIN_RENDER_SCHEMES[0]);
+    const result = await service.syncMap(project.id, project.revision, map, scheme);
+    expect(result.summary).toMatchObject({ addedObjectIds: ['new-prop'], removedObjectIds: [], changedObjectIds: [], worldChanged: true, schemeChanged: true });
+    expect(result.project.mapSnapshot).toEqual(map);
+    expect(result.project.schemeSnapshot).toEqual(scheme);
+    expect(result.project.document).toEqual(before.document);
+    expect(result.project.resources).toEqual(before.resources);
+    expect(result.project.confirmed).toEqual(before.confirmed);
+    expect(result.project.candidate).toBeNull();
+    expect(result.project.mapSync).toMatchObject({ sourceMapVersion: map.version, sourceMapUpdatedAt: map.updatedAt, summary: result.summary });
+    const compiled = await service.compile(result.project.id, result.project.revision);
+    expect(compiled.candidate?.validation.valid).toBe(true);
+    expect(compiled.candidate?.map.objects.some((object) => object.id === 'new-prop')).toBe(true);
+    expect(compiled.confirmed).toEqual(before.confirmed);
+  });
+
+  it('rejects synchronizing a different WorldForge map and reports stable object-level differences', async () => {
+    const service = new CgService(new CgStore(root));
+    const project = await service.create(mapFixture(), null);
+    const other = mapFixture(); other.id = 'another-map';
+    await expect(service.syncMap(project.id, project.revision, other, null)).rejects.toMatchObject({ code: 'map_mismatch' });
+    expect(await service.store.read(project.id)).toEqual(project);
+    const changed = structuredClone(project.mapSnapshot);
+    const object = createMapObject('Rock'); object.id = 'rock'; changed.objects.push(object);
+    const next = structuredClone(changed); next.objects[0].visible = false;
+    expect(summarizeMapSync(changed, next, null, null)).toMatchObject({ addedObjectIds: [], removedObjectIds: [], changedObjectIds: ['rock'], worldChanged: false, schemeChanged: false });
+  });
+
+  it('keeps the last confirmed playback when a synchronized map removes a bound object', async () => {
+    const service = new CgService(new CgStore(root));
+    const map = mapFixture();
+    const bound = createMapObject('Bound actor', 'cg_demo_actor_asset'); bound.id = 'bound-actor'; map.objects.push(bound);
+    let project = await service.create(map, null);
+    project = await service.plan(project.id, project.revision, '离线演示', true);
+    project = await service.store.transaction(project.id, project.revision, (draft) => { draft.document.entities[0].objectId = 'bound-actor'; });
+    project = await service.compile(project.id, project.revision);
+    expect(project.candidate?.validation.valid).toBe(true);
+    project = await service.confirm(project.id, project.revision, project.candidate!.id, project.candidate!.inputHash);
+    const confirmed = structuredClone(project.confirmed);
+    const nextMap = structuredClone(project.mapSnapshot); nextMap.objects = []; nextMap.version += 1; nextMap.updatedAt += 1;
+    const synced = await service.syncMap(project.id, project.revision, nextMap, null);
+    project = await service.compile(synced.project.id, synced.project.revision);
+    expect(project.candidate?.validation.valid).toBe(false);
+    expect(project.candidate?.validation.diagnostics).toEqual(expect.arrayContaining([expect.objectContaining({ code: 'missing_object', message: expect.stringContaining('bound-actor'), nodeIds: expect.arrayContaining(['demo_actor']) })]));
+    expect(project.confirmed).toEqual(confirmed);
+  });
 
   it('serves the complete demo → compile → confirm → export → reopen flow', async () => {
     let response = await post(`${base}/projects`, { map: mapFixture(), scheme: null });
@@ -290,6 +546,22 @@ describe('CG HTTP API', () => {
     expect(await (await fetch(`${base}/projects`)).json()).toMatchObject({ projects: [{ id: project.id, confirmed: true }] });
     expect(await (await fetch(`${base}/projects/${project.id}/progress`)).json()).toMatchObject({ stage: 'ready', running: false });
     expect((await fetch(`${base}/capabilities`)).status).toBe(200);
+  });
+
+  it('syncs the current WorldForge snapshot through the project API and invalidates only the candidate', async () => {
+    let response = await post(`${base}/projects`, { map: mapFixture(), scheme: null });
+    let project: CgProject = await response.json();
+    response = await post(`${base}/projects/${project.id}/plan`, { revision: project.revision, prompt: '离线演示', demo: true }); project = await response.json();
+    response = await post(`${base}/projects/${project.id}/compile`, { revision: project.revision }); project = await response.json();
+    response = await post(`${base}/projects/${project.id}/confirm`, { revision: project.revision, compileId: project.candidate!.id, inputHash: project.candidate!.inputHash }); project = await response.json();
+    const confirmed = structuredClone(project.confirmed);
+    const map = structuredClone(project.mapSnapshot);
+    const marker = createMapObject('Synced marker'); marker.id = 'synced-marker'; map.objects.push(marker); map.version += 1; map.updatedAt += 1;
+    response = await post(`${base}/projects/${project.id}/sync-map`, { revision: project.revision, map, scheme: BUILTIN_RENDER_SCHEMES[0] });
+    expect(response.status).toBe(200);
+    const result = await response.json();
+    expect(result.summary.addedObjectIds).toEqual(['synced-marker']);
+    expect(result.project).toMatchObject({ candidate: null, confirmed, mapSnapshot: { id: map.id, version: map.version } });
   });
 
   it('returns actionable status codes for bad revisions, bad patches, missing assets and remote origins', async () => {

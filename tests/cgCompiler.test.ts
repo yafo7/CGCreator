@@ -2,8 +2,9 @@ import { describe, expect, it } from 'vitest';
 import { createEmptyMap, createMapObject, sampleTerrainHeight, type MapAsset } from '../src/shared/map';
 import { buildModelColliderPlan } from '../src/shared/modelBounds';
 import { applyDirectorPatch, compileDirector, evaluateCG, stableHash, validateDirectorDocument } from '../src/shared/cgCompiler';
-import { freeGroundPoint } from '../src/shared/cgPath';
+import { freeGroundPoint, sampleSmoothPath } from '../src/shared/cgPath';
 import type { CgResources, DirectorDocument } from '../src/shared/cgTypes';
+import { inspectCgView } from '../src/shared/cgViewSemantics';
 
 function fixture() {
   const map = createEmptyMap('CG test', 'map-test', [20, 10, 20]);
@@ -62,6 +63,61 @@ describe('CG deterministic compiler', () => {
     const alongMotion = sideFrame.camera.position[0] - sideFrame.entities.hero.position[0];
     const lateral = sideFrame.camera.position[2] - sideFrame.entities.hero.position[2];
     expect(Math.abs(alongMotion)).toBeLessThan(Math.abs(lateral));
+  });
+
+  it('builds an AI-readable world hierarchy and reports mechanical view semantics', () => {
+    const { document, map } = fixture();
+    map.assets![0].tags = ['character', 'visitor'];
+    map.visualSemantics.zones.push({ id: 'garden', tags: ['grass'], center: [0, 0], radius: 6, intensity: 1 });
+    map.waterBodies.push({ id: 'pond', name: 'Pond', type: 'lake', level: 0, depth: 1, width: 3, points: [[-2, -2], [2, -2], [2, 2], [-2, 2]] });
+    const result = compileDirector(document, map);
+    expect(result.semanticIndex.entities).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: 'object:map-actor', kind: 'object', tags: expect.arrayContaining(['character']) }),
+      expect.objectContaining({ id: 'object:map-actor/node:body', kind: 'model-part', parentId: 'object:map-actor' }),
+      expect.objectContaining({ id: 'zone:garden', kind: 'zone', tags: ['grass'] }),
+      expect.objectContaining({ id: 'water:pond', kind: 'water' })
+    ]));
+    const observation = inspectCgView(result, 2, 16 / 9);
+    expect(observation.shotId).toBe('shot-one');
+    expect(observation.items.find((item) => item.objectId === 'map-actor')).toMatchObject({
+      entityId: 'hero', screenRegion: expect.stringMatching(/left|center|right/)
+    });
+    expect(observation.items.find((item) => item.objectId === 'map-actor')!.coverage).toBeGreaterThan(0);
+  });
+
+  it('routes actors through ordered hard points and lets a camera path override automatic travel positions', () => {
+    const { document, map } = fixture();
+    document.anchors.push(
+      { id: 'route-via', name: 'Around pond', kind: 'point', position: [0, 0, 3] },
+      { id: 'camera-a', name: 'Camera A', kind: 'point', position: [-4, 3, 6] },
+      { id: 'camera-b', name: 'Camera B', kind: 'point', position: [0, 3, 6] },
+      { id: 'camera-c', name: 'Camera C', kind: 'point', position: [4, 3, 6] }
+    );
+    document.constraints.push(
+      { id: 'via-lock', source: 'user', strength: 'hard', type: 'action-route', targetId: 'walk', anchorId: 'route-via', order: 0 },
+      { id: 'camera-path-a', source: 'user', strength: 'hard', type: 'camera-path', targetId: 'shot-one', anchorId: 'camera-a', order: 0 },
+      { id: 'camera-path-b', source: 'user', strength: 'hard', type: 'camera-path', targetId: 'shot-one', anchorId: 'camera-b', order: 1 },
+      { id: 'camera-path-c', source: 'user', strength: 'hard', type: 'camera-path', targetId: 'shot-one', anchorId: 'camera-c', order: 2 }
+    );
+    const result = compileDirector(document, map);
+    expect(result.validation.valid).toBe(true);
+    expect(result.actions.find((action) => action.id === 'walk')?.path).toContainEqual([0, 0, 3]);
+    expect(result.shots[0].path).toEqual([[-4, 3, 6], [0, 3, 6], [4, 3, 6]]);
+    expect(result.shots[0].pathControlIds).toEqual(['camera-a', 'camera-b', 'camera-c']);
+    expect(result.shots[0].pathInterpolation).toBe('smooth');
+    expect(evaluateCG(result, 2.5).camera.position).toEqual([0, 3, 6]);
+  });
+
+  it('moves through authored camera controls with continuous, distance-based curve sampling', () => {
+    const path: Array<[number, number, number]> = [[-5, 2, 4], [0, 7, 1], [8, 3, 5]];
+    expect(sampleSmoothPath(path, 0).position).toEqual(path[0]);
+    expect(sampleSmoothPath(path, 1).position).toEqual(path[2]);
+    const before = sampleSmoothPath(path, 0.49).direction;
+    const after = sampleSmoothPath(path, 0.51).direction;
+    const dot = before[0] * after[0] + before[1] * after[1] + before[2] * after[2];
+    expect(dot).toBeGreaterThan(0);
+    expect(sampleSmoothPath(path, 0.5).position[1]).toBeGreaterThan(6.5);
+    expect(sampleSmoothPath(path, 0.5)).toEqual(sampleSmoothPath(path, 0.5));
   });
 
   it('uses named eye landmarks and a portrait lens for semantic close-ups', () => {

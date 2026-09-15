@@ -2,9 +2,11 @@
 
 CGCreator extends WorldForge with an editable realtime cinematic compiler and workspace. The repository owner has authorized modifications to core source for this implementation. Retain the WorldForge editor and map protocol. CG-specific code lives in `src/shared/cg*`, `src/server/cg*`, and `src/client/cg*`.
 
+The upstream main baseline and intentional integration files are recorded in `worldforge-base.json`. Run `npm run verify:worldforge` when updating the base or integration. Keep map generation, storage, transactions, exports and world rendering aligned with that baseline. CG has one document/compile pipeline, under `/api/cg/projects`, with `CgStore` persistence. Do not add director-specific types or storage to the WorldForge map API or map-core exports. Merge future upstream main updates, review the integration diff, update the baseline manifest and verify before adopting them. The sibling worldforge-studio checkout remains a clean upstream reference.
+
 Director intent, compiled tracks, and confirmed playback are separate artifacts. Always enforce user constraints in code. AI patches cannot remove or rewrite manual constraints. Playback must evaluate an absolute time without accumulated motion; actor world movement has one owner, and animation clips are in-place. Keep a confirmed version available during failed or incomplete revisions. Do not claim unsupported actions succeeded.
 
-Project guidance is in `skills/cg-director/SKILL.md` and `skills/cg-camera-direction/SKILL.md`. These guide authoring; executable capability definitions and validation live in the TypeScript compiler. Run all tests, build, and visible browser verification before delivery.
+Project guidance is in `skills/cg-director/SKILL.md`, `skills/cg-camera-direction/SKILL.md`, and `skills/cg-spatial-direction/SKILL.md`. These guide authoring; executable capability definitions and validation live in the TypeScript compiler. Run all tests, build, and visible browser verification before delivery.
 
 ## Scope
 

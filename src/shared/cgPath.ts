@@ -1,6 +1,7 @@
 import { getMapBounds, sampleTerrainHeight, type EditableMap, type MapObjectAabb } from './map';
 import { isPointInsidePlayableArea } from './mapLayout';
 import type { CgVec3 } from './cgTypes';
+import { CatmullRomCurve3, Vector3 } from 'three';
 
 const EPS = 1e-5;
 export const distance = (a: CgVec3, b: CgVec3) => Math.hypot(a[0] - b[0], a[1] - b[1], a[2] - b[2]);
@@ -153,4 +154,51 @@ export function samplePath(path: CgVec3[], progress: number): { position: CgVec3
     remaining -= lengths[i];
   }
   return { position: [...path[path.length - 1]], direction: [0, 0, 1] };
+}
+
+/**
+ * Samples an open, centripetal Catmull-Rom path by travelled distance. It passes
+ * through every authored point and avoids the large loops that uniform splines
+ * can create around unevenly spaced controls. Two-point and legacy paths remain
+ * exactly linear.
+ */
+export function sampleSmoothPath(path: CgVec3[], progress: number): { position: CgVec3; direction: CgVec3 } {
+  if (path.length < 3) return samplePath(path, progress);
+  const curve = smoothCurve(path);
+  const u = Math.max(0, Math.min(1, progress));
+  if (u === 0) return { position: [...path[0]], direction: curve.getTangentAt(0).toArray() as CgVec3 };
+  if (u === 1) return { position: [...path[path.length - 1]], direction: curve.getTangentAt(1).toArray() as CgVec3 };
+  const position = curve.getPointAt(u);
+  const tangent = curve.getTangentAt(u);
+  return {
+    position: position.toArray() as CgVec3,
+    direction: tangent.lengthSq() > 1e-12 ? tangent.toArray() as CgVec3 : [0, 0, 1]
+  };
+}
+
+/** The same curve used by playback, exposed for editor guides and validation. */
+export function smoothPathPolyline(path: CgVec3[], divisions = Math.max(24, (path.length - 1) * 24)): CgVec3[] {
+  if (path.length < 3) return path.map((point) => [...point]);
+  const curve = smoothCurve(path);
+  return Array.from({ length: divisions + 1 }, (_, index) => curve.getPointAt(index / divisions).toArray() as CgVec3);
+}
+
+/** Validates the swept ground-agent volume along the smooth curve, including thin obstacles between samples. */
+export function smoothGroundPathIsFree(map: EditableMap, boxes: MapObjectAabb[], path: CgVec3[], radius: number, height: number): boolean {
+  if (path.length < 3) return true;
+  const divisions = Math.max(64, path.length * 24);
+  let previous: CgVec3 | null = null;
+  for (let index = 0; index <= divisions; index++) {
+    const point = sampleSmoothPath(path, index / divisions).position;
+    point[1] = sampleTerrainHeight(map, point[0], point[2]);
+    if (!freeGroundPoint(map, boxes, point, radius, height) || (previous && !groundSegment(map, boxes, previous, point, radius, height))) return false;
+    previous = point;
+  }
+  return true;
+}
+
+function smoothCurve(path: CgVec3[]): CatmullRomCurve3 {
+  const curve = new CatmullRomCurve3(path.map((point) => new Vector3(...point)), false, 'centripetal', 0.5);
+  curve.arcLengthDivisions = Math.max(200, path.length * 64);
+  return curve;
 }

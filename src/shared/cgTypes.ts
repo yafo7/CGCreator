@@ -1,6 +1,8 @@
 import type { EditableMap, MapAsset } from './map';
 import type { MapOperation } from './mapOperations';
 import type { RenderScheme } from './renderScheme';
+import type { WorldSemanticIndex } from './cgWorldSemantics';
+import type { CgPoseRig } from './cgPoseEvaluator';
 
 export type CgVec3 = [number, number, number];
 export type CgQuat = [number, number, number, number];
@@ -16,6 +18,7 @@ export interface CgAnchor {
   fov?: number;
   space?: 'world' | 'object';
   objectId?: string;
+  binding?: { kind: 'guide'; guideId: string; progress: number } | { kind: 'seat-approach'; objectId: string; nodeId: string };
 }
 export interface CgEntity {
   id: string;
@@ -47,6 +50,9 @@ export interface CgCameraIntent {
   aim?: CgCameraAim;
   /** Desired subject position in normalized screen coordinates, each axis in [-0.45, 0.45]. */
   screenPosition?: [number, number];
+  layout?: 'solo' | 'two-shot' | 'over-shoulder';
+  aimMode?: 'fixed' | 'follow';
+  pitch?: number;
 }
 export interface CgShotTransition {
   type: 'cut' | 'ease-in-out';
@@ -61,11 +67,16 @@ export interface CgShot {
   camera: CgCameraIntent;
   transition?: CgShotTransition;
   subtitle?: string;
+  /** V2 coverage refers to an already scheduled behavior. */
+  behaviorId?: string;
+  skillId?: string;
+  coveragePurpose?: 'geography' | 'follow' | 'destination' | 'emotion' | 'dialogue' | 'reaction' | 'contact';
+  autoDuration?: boolean;
 }
 export interface CgAction {
   id: string;
   entityId: string;
-  type: 'move' | 'face' | 'animate' | 'visibility' | 'effect' | 'attach' | 'detach';
+  type: 'move' | 'face' | 'animate' | 'visibility' | 'effect' | 'attach' | 'detach' | 'sit' | 'stand' | 'dialogue' | 'hold';
   start: CgTimeRef;
   duration: number;
   targetAnchorId?: string;
@@ -74,21 +85,27 @@ export interface CgAction {
   visible?: boolean;
   effect?: 'spark';
   socketId?: string;
+  route?: { guideIds: string[]; policy: 'required' | 'preferred'; locomotion: 'walk' | 'run'; maxSpeed?: number };
+  interaction?: { objectId: string; seatNodeId: string; approachAnchorId: string };
+  endBehavior?: 'restore' | 'hold';
+  purpose?: string;
 }
 export interface CgConstraint {
   id: string;
   source: 'user';
   strength: 'hard';
-  type: 'entity-position' | 'action-target' | 'camera-pose' | 'action-time' | 'shot-duration';
+  type: 'entity-position' | 'action-target' | 'action-route' | 'camera-pose' | 'camera-path' | 'action-time' | 'shot-duration';
   targetId: string;
   anchorId?: string;
   seconds?: number;
   edge?: 'start' | 'end';
   scope?: 'initial' | 'throughout';
+  /** Stable ordering for editable route/camera path control points. */
+  order?: number;
 }
 /** Authoritative intent. No generated keyframes live in this document. */
 export interface DirectorDocument {
-  schemaVersion: 1;
+  schemaVersion: 1 | 2;
   id: string;
   title: string;
   sourcePrompt: string;
@@ -112,6 +129,7 @@ export interface CgClip {
   loop: boolean;
   rootMotion: 'in-place';
   source: 'generated' | 'builtin';
+  locomotion?: { kind: 'walk' | 'run'; nominalSpeed: number; minRate: number; maxRate: number };
   tracks: Record<string, {
     position?: CgVec3[];
     rotation?: CgVec3[];
@@ -134,8 +152,13 @@ export interface CgEntityState {
   visible: boolean;
   clipId?: string;
   clipTime?: number;
+  clipWeight?: number;
   attachedTo?: string;
   socketId?: string;
+  posture?: 'standing' | 'seated';
+  behaviorId?: string;
+  landmarks?: Partial<Record<'eyes' | 'face' | 'head' | 'hips' | 'leftFoot' | 'rightFoot', CgVec3>>;
+  faceForward?: CgVec3;
 }
 export interface CgCameraPose { position: CgVec3; quaternion: CgQuat; fov: number; target?: CgVec3 }
 export interface CgBinding {
@@ -145,15 +168,26 @@ export interface CgBinding {
   height: number;
   /** Model-local, floor-aligned semantic points used by camera composition. */
   focus?: { body: CgVec3; upperBody: CgVec3; face: CgVec3; eyes: CgVec3; faceHeight: number; source: 'named-head' | 'proportional-fallback' };
+  poseRig?: CgPoseRig;
 }
-export interface CgCompiledShot { id: string; start: number; end: number; camera: CgCameraIntent; transition?: CgShotTransition; lockedPose?: CgCameraPose; inputHash: string }
+export type CgPathInterpolation = 'linear' | 'smooth';
+export interface CgCompiledShot { id: string; start: number; end: number; camera: CgCameraIntent; transition?: CgShotTransition; lockedPose?: CgCameraPose; path?: CgVec3[]; pathControlIds?: string[]; pathInterpolation?: CgPathInterpolation; inputHash: string; behaviorId?: string; skillId?: string; referenceBehavior?: boolean; cameraSamples?: { fps: number; poses: CgCameraPose[] }; candidateScores?: Array<{ skillId: string; score: number; feasible: boolean }> }
 export interface CgCompiledAction extends Omit<CgAction, 'start'> {
   start: number;
   end: number;
   path?: CgVec3[];
+  /** Stable authored anchors shown in the editor; the baked navigation path may contain more points. */
+  pathControls?: Array<{ id: string; position: CgVec3; role: 'start' | 'via' | 'end'; source: 'auto' | 'user' }>;
+  pathInterpolation?: CgPathInterpolation;
   from?: CgVec3;
   to?: CgVec3;
   inputHash: string;
+  contact?: { objectId: string; nodeId: string; position: CgVec3; rootPosition: CgVec3; rootQuaternion: CgQuat; tolerance: number };
+  surfaceIds?: string[];
+  rootRotations?: CgQuat[];
+  rootSamples?: { fps: number; positions: CgVec3[]; rotations: CgQuat[] };
+  playbackRate?: number;
+  motionBlend?: number;
 }
 export interface CompiledCG {
   schemaVersion: 1;
@@ -165,6 +199,7 @@ export interface CompiledCG {
   map: EditableMap;
   scheme: RenderScheme | null;
   resources: CgResources;
+  semanticIndex: WorldSemanticIndex;
   duration: number;
   bindings: CgBinding[];
   initial: Record<string, CgEntityState>;
@@ -173,6 +208,9 @@ export interface CompiledCG {
   dependencies: Record<string, string[]>;
   changedNodeIds: string[];
   validation: CgValidation;
+  evaluationVersion?: 2;
+  stage?: 'performance' | 'complete';
+  performance?: { duration: number; events: Array<{ id: string; actionId: string; time: number; kind: 'start' | 'end' | 'contact' }>; occupancy: Array<{ objectId: string; slotId: string; entityId: string; start: number; end: number }> };
 }
 export interface CgFrame {
   time: number;
@@ -188,6 +226,21 @@ export type CgPatchOperation =
   | { type: 'anchor.upsert'; anchor: CgAnchor }
   | { type: 'constraint.upsert'; constraint: CgConstraint }
   | { type: 'constraint.remove'; id: string };
+export interface CgMapSyncSummary {
+  addedObjectIds: string[];
+  removedObjectIds: string[];
+  changedObjectIds: string[];
+  changedAssetIds: string[];
+  worldChanged: boolean;
+  schemeChanged: boolean;
+}
+export interface CgMapSyncRecord {
+  sourceMapVersion: number;
+  sourceMapUpdatedAt: number;
+  sourceHash: string;
+  syncedAt: number;
+  summary: CgMapSyncSummary;
+}
 export interface CgProject {
   schemaVersion: 1;
   id: string;
@@ -199,6 +252,8 @@ export interface CgProject {
   resources: CgResources;
   candidate: CompiledCG | null;
   confirmed: CompiledCG | null;
+  mapSync?: CgMapSyncRecord;
+  coveragePending?: boolean;
   updatedAt: number;
 }
 export interface CgProjectSummary { id: string; title: string; mapId: string; revision: number; confirmed: boolean; updatedAt: number }

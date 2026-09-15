@@ -5,6 +5,7 @@
 ## CGCreator V1
 
 - 保留 WorldForge 地图生成、编辑、导入与渲染工作流。点击顶部 **CG 导演**，从当前可见地图和渲染方案创建独立快照。
+- 从 CG 返回 WorldForge 修改地图后，再次打开同一演出会检测快照差异。点击 **同步当前地图** 会保留导演文档、人工约束、资源和上一个已确认版本，换用当前地图并自动重新编译。
 - 输入剧情生成导演文档；**离线演示**使用明确标记的内置角色和动画，便于在不调用模型服务时体验完整流程。
 - 编译并校验后播放、暂停、拖动时间轴，选择镜头进行“慢一点”“改成特写”等局部修改。
 - 在场景标点锁定角色/道具位置、行动终点，或手动摆好摄像机后锁定机位；数值时间约束与其他人工约束由编译器强制执行。
@@ -13,6 +14,8 @@
 首次运行：`npm ci`，然后 `npm run dev`。打开 **http://localhost:5182**，API 为 **http://127.0.0.1:8799**。生产模式：`npm run build` 后 `npm run server`，打开 **http://127.0.0.1:8799**。
 
 架构、协议与第一版边界见 [CGCreator 架构](docs/cgcreator-architecture.md)。参考 skill 和库的选用记录见 [来源说明](docs/cgcreator-sources.md)。下文保留 WorldForge 底座的功能说明。
+
+上游 main 基线与必要集成文件记录在 [worldforge-base.json](worldforge-base.json)。运行 `npm run verify:worldforge` 可检查地图生成、存储、导出、渲染等底座是否仍与基线一致。地图菜单中的工程导出负责 WorldForge 场景；CG 工作区的「导出已确认」负责当前确认的演出。
 
 ## WorldForge 底座
 
@@ -150,7 +153,7 @@ npm run server
 
 ## 数据
 
-默认数据目录为 `data/map-editor`，其中地图、资产、自定义渲染方案与 CG 剧情文档分开保存。CG 位于 `cinematics/<projectId>/<cgId>.json`，引用地图版本、导演策划稿和空间参考，不复制地图或模型资产。可以通过 `WORLDFORGE_DATA_DIR` 指定其他目录。
+默认数据目录为 `data/map-editor`，地图、资产和自定义渲染方案由 WorldForge 管理；CG 项目保存在 `cgcreator/projects/<id>.json`，生成资源缓存位于 `cgcreator/resources/`。每个 CG 项目保存地图与渲染方案快照、DirectorDocument、资源及候选/已确认版本。可以通过 `WORLDFORGE_DATA_DIR` 指定数据根目录。
 
 地图命令：
 

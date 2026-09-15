@@ -1,7 +1,11 @@
 import type { EditableMap } from '../shared/map';
 import type { RenderScheme } from '../shared/renderScheme';
-import type { CgPatchOperation, CgProject, CgProjectSummary, CgVec3, CompiledCG, DirectorDocument } from '../shared/cgTypes';
-import { CgPlaybackRuntime } from './cgRuntime';
+import type { CgMapSyncSummary, CgPatchOperation, CgProject, CgProjectSummary, CgVec3, CompiledCG, DirectorDocument } from '../shared/cgTypes';
+import { stableHash } from '../shared/cgValidation';
+import { inspectCgView } from '../shared/cgViewSemantics';
+import { buildWorldSemanticIndex } from '../shared/cgWorldSemantics';
+import { renderWorldInspector } from './cgWorldInspector';
+import { CgPlaybackRuntime, type CgEditablePathPoint } from './cgRuntime';
 import { serverHttpBase } from './serverEndpoint';
 import './cgWorkspace.css';
 
@@ -13,7 +17,19 @@ const movement: Record<string, string> = { static: '固定', dolly: '推镜', tr
 const framing: Record<string, string> = { wide: '全景', medium: '中景', 'close-up': '特写', 'over-shoulder': '越肩' };
 const cameraView: Record<string, string> = { front: '正面', 'front-three-quarter': '前侧 3/4', side: '侧面', 'rear-three-quarter': '后侧 3/4', rear: '背面' };
 const cameraAim: Record<string, string> = { body: '全身构图', 'upper-body': '上半身构图', face: '面部对焦', eyes: '眼部对焦', interaction: '互动构图' };
-const actionName: Record<string, string> = { move: '移动', face: '朝向', animate: '动作', visibility: '显隐', effect: '特效', attach: '附着', detach: '分离' };
+const actionName: Record<string, string> = { move: '移动', face: '朝向', animate: '动作', visibility: '显隐', effect: '特效', attach: '附着', detach: '分离', sit: '坐下与保持接触', dialogue: '对话表演', hold: '保持状态' };
+
+export function describeMapSync(summary: CgMapSyncSummary): string {
+  const changes = [
+    summary.addedObjectIds.length ? `新增 ${summary.addedObjectIds.length} 个物体` : '',
+    summary.removedObjectIds.length ? `移除 ${summary.removedObjectIds.length} 个物体` : '',
+    summary.changedObjectIds.length ? `修改 ${summary.changedObjectIds.length} 个物体` : '',
+    summary.changedAssetIds.length ? `更新 ${summary.changedAssetIds.length} 个资源` : '',
+    summary.worldChanged ? '地形或场景结构已更新' : '',
+    summary.schemeChanged ? '渲染方案已更新' : ''
+  ].filter(Boolean);
+  return changes.join('、') || '快照元数据已更新';
+}
 
 export function parseCgTarget(value: string): { kind: string; targetId: string } {
   const delimiter = value.indexOf(':');
@@ -43,11 +59,13 @@ class CgWorkspace {
   private project: CgProject | null = null;
   private bundle: CompiledCG | null = null;
   private selectedShot = '';
+  private selectedBehavior = '';
   private selectedPoint: [number, number, number] | null = null;
   private time = 0;
   private playing = false;
   private manual = false;
   private marking = false;
+  private pathEditing = false;
   private busy = false;
   private closed = false;
   private frameId = 0;
@@ -55,6 +73,7 @@ class CgWorkspace {
   private resize: ResizeObserver | null = null;
   private progressId = 0;
   private abort = new AbortController();
+  private viewObservationKey = '';
 
   constructor(private options: CgWorkspaceOptions) {}
 
@@ -72,18 +91,21 @@ class CgWorkspace {
       <div class="cg-body">
         <aside class="cg-story"><div class="cg-panel-heading"><span>01 / 导演意图</span><span class="cg-muted">DIRECT</span></div>
           <label class="cg-label" for="cg-project-select">演出项目</label><div class="cg-project-row"><select id="cg-project-select" data-cg="projects"><option value="">新建 · 当前地图</option></select><button data-do="load" title="打开所选项目">打开</button></div>
+          <div data-cg="map-sync" class="cg-map-sync"><span data-cg="map-sync-text">打开项目后检查地图版本</span><button data-do="sync-map" disabled>同步当前地图</button></div>
           <label class="cg-label" for="cg-prompt">描述这一段故事</label><textarea id="cg-prompt" data-cg="prompt" rows="5" placeholder="角色走向场景中央，镜头缓缓跟随。角色停下后，切到面部特写，停留片刻。"></textarea>
           <button data-do="plan" class="cg-primary cg-full">✦ 生成导演文档</button>
           <button data-do="demo" class="cg-demo cg-full">体验内置演出 · 无需 AI 服务</button>
+          <button data-do="foundation-demo" class="cg-demo cg-full">基础闭环演示 · 跑步、对话、坐下</button>
           <p class="cg-help">从当前地图开始。角色、道具和运镜被编译成可编辑的实时演出。</p>
           <div class="cg-panel-heading cg-divider"><span>镜头列表</span><span data-cg="shot-count" class="cg-muted">0 SHOTS</span></div>
           <div data-cg="shots" class="cg-shot-list"><div class="cg-empty">写下导演意图，或体验内置演出。镜头与动作将在这里展开。</div></div>
           <div class="cg-panel-heading cg-divider"><span>角色与资源</span><span data-cg="resource-count" class="cg-muted">0</span></div><div data-cg="entities" class="cg-entities"></div>
+          <details class="cg-semantic" open><summary>已求解的演出行为</summary><div data-cg="performance" class="cg-semantic-list">编译后显示行为时间、接触和镜头选择。</div></details>
         </aside>
         <main class="cg-center">
           <div class="cg-view" data-cg="view"><canvas data-cg="canvas" aria-label="可交互的 3D 演出预览"></canvas>
             <div class="cg-view-top"><span class="cg-live">● REALTIME</span><span data-cg="view-label">场景预览</span><span data-cg="revision" class="cg-revision">未生成</span></div>
-            <div class="cg-view-tools"><button data-do="manual" title="用鼠标旋转、平移和缩放摄影机">自由机位</button><button data-do="mark" title="在可见场景表面点击标点">＋ 场景标点</button><button data-do="reset-view">回到演出机位</button></div>
+            <div class="cg-view-tools"><button data-do="manual" title="用鼠标旋转、平移和缩放摄影机">自由机位</button><button data-do="paths" title="显示动线；单击选线，双击编辑控制点">路线编辑</button><button data-do="mark" title="在可见场景表面点击标点">＋ 场景标点</button><button data-do="reset-view">回到演出机位</button></div>
             <div data-cg="subtitle" class="cg-subtitle"></div><div data-cg="view-hint" class="cg-view-hint">拖动旋转 · 右键平移 · 滚轮缩放</div>
             <div data-cg="loading" class="cg-loading"><span></span>正在载入 WorldForge 场景…</div>
           </div>
@@ -102,6 +124,8 @@ class CgWorkspace {
           <label class="cg-label" for="cg-duration">镜头时长 / 秒</label><div class="cg-project-row"><input id="cg-duration" data-cg="duration" type="number" min="0.1" max="600" step="0.1" value="3"><button data-do="lock-duration" disabled>锁定</button></div>
           <label class="cg-label" for="cg-action-time">动作开始 / 秒</label><div class="cg-project-row"><input id="cg-action-time" data-cg="action-time" type="number" min="0" max="600" step="0.1" value="0"><button data-do="lock-time" disabled>锁定</button></div>
           <p class="cg-help">人工约束优先于 AI。冲突会明确报错，确认前必须解决。</p><div data-cg="constraints" class="cg-constraints"></div>
+          <details class="cg-semantic" open><summary>镜头当前能看到什么</summary><div data-cg="view-semantics" class="cg-semantic-list"><p>编译预览后显示画面语义。</p></div></details>
+          <details class="cg-semantic"><summary>导演地图语义 · 当前快照</summary><input data-cg="world-filter" aria-label="搜索地图区域或物体" placeholder="搜索凉亭、树林、道路或 ID"><div data-cg="world-semantics" class="cg-semantic-list"><p>载入地图语义中…</p></div></details>
           <details class="cg-document"><summary>查看结构化导演文档</summary><pre data-cg="document">等待生成</pre></details>
         </aside>
       </div>
@@ -114,9 +138,12 @@ class CgWorkspace {
     this.text('source', this.options.map.name);
     this.root.addEventListener('click', event => { const button = (event.target as Element).closest<HTMLButtonElement>('[data-do]'); if (button && !button.disabled) void this.handle(button.dataset.do!, button); });
     this.el<HTMLInputElement>('seek').addEventListener('input', event => { this.playing = false; this.time = Number((event.target as HTMLInputElement).value); this.syncButtons(); this.draw(); });
+    this.el<HTMLSelectElement>('projects').addEventListener('change', () => this.renderMapSync());
     this.el<HTMLSelectElement>('lock-target').addEventListener('change', () => this.syncButtons());
+    this.el<HTMLInputElement>('world-filter').addEventListener('input', () => this.renderWorld());
     this.el<HTMLInputElement>('file').addEventListener('change', () => void this.importBundle());
     this.el<HTMLCanvasElement>('canvas').addEventListener('pointerdown', event => {
+      if (this.pathEditing && this.runtime?.pickPathControl(event.clientX, event.clientY)) { event.stopPropagation(); return; }
       if (!this.marking || this.busy || !this.runtime) return;
       this.selectedPoint = this.runtime.pick(event.clientX, event.clientY);
       if (!this.selectedPoint) { this.status('没有命中可见表面，请选择地面或物体表面。'); return; }
@@ -127,7 +154,27 @@ class CgWorkspace {
       this.status('标点已记录。选择角色、道具或移动动作，然后锁定。');
       this.syncButtons();
     });
-    this.root.addEventListener('keydown', event => { event.stopPropagation(); if (event.key === 'Escape' && this.marking) { this.marking = false; this.root.classList.remove('cg-is-marking'); this.runtime?.setManual(this.manual); } });
+    this.el<HTMLCanvasElement>('canvas').addEventListener('click', event => {
+      if (!this.pathEditing || this.busy || event.detail !== 1) return;
+      const selection = this.runtime?.selectPath(event.clientX, event.clientY);
+      this.status(selection ? `已选择${selection.kind === 'camera' ? '摄影机轨迹' : '角色走位'}。双击这条线进入控制点编辑。` : '未选择动线。单击绿色角色走位或蓝色摄影机轨迹。');
+    });
+    this.el<HTMLCanvasElement>('canvas').addEventListener('dblclick', event => {
+      if (!this.pathEditing || this.busy || !this.runtime) return;
+      event.preventDefault();
+      if (this.runtime.insertPathPoint(event.clientX, event.clientY)) {
+        this.status('正在新增控制点并重新编译…');
+        return;
+      }
+      const selection = this.runtime.editSelectedPath();
+      if (selection) this.status(`正在编辑${selection.kind === 'camera' ? '摄影机轨迹' : '角色走位'}：拖动控制点；再次双击曲线可增加途经点。`);
+    });
+    this.root.addEventListener('keydown', event => {
+      event.stopPropagation();
+      if (event.key !== 'Escape') return;
+      if (this.marking) { this.marking = false; this.root.classList.remove('cg-is-marking'); this.runtime?.setManual(this.manual); return; }
+      if (this.pathEditing && this.runtime?.cancelPathPointEditing()) this.status('已退出控制点编辑；动线仍保持选中。双击可再次编辑。');
+    });
     this.syncButtons();
     void this.refreshProjects();
     try {
@@ -138,6 +185,7 @@ class CgWorkspace {
       this.resize = new ResizeObserver(() => this.runtime?.resize(view.clientWidth, view.clientHeight));
       this.resize.observe(view);
       this.runtime.resize(view.clientWidth, view.clientHeight);
+      this.renderWorld();
       this.lastFrame = performance.now();
       this.syncButtons();
       this.loop();
@@ -170,19 +218,59 @@ class CgWorkspace {
   }
 
   private async handle(action: string, button: HTMLButtonElement): Promise<void> {
+    if (action === 'foundation-demo') {
+      await this.run('正在准备独立的基础演出验证场景…', async () => {
+        const project = await this.request<CgProject>('/foundation-demo', {});
+        this.selectedShot = '';
+        await this.present(project, true);
+        await this.refreshProjects();
+        this.status('已打开独立演示场景：沿弯路跑步、双人对话、坐下并保持坐姿。演示不修改当前 WorldForge 地图，确认仍由你决定。');
+      });
+      return;
+    }
+    if (action === 'world-focus') {
+      await this.run('正在定位当前地图区域…', async () => {
+        const map = this.worldMap;
+        const entity = buildWorldSemanticIndex(map).entities.find(e => e.id === button.dataset.id);
+        if (!entity || !this.runtime) return;
+        this.playing = false;
+        if (this.bundle && this.project) await this.resetScene(map, this.project.schemeSnapshot);
+        else if (this.bundle) this.time = 0; // Keep an imported read-only bundle and its map available.
+        this.manual = true;
+        this.runtime.focusWorldEntity(entity, map);
+        this.status(`已定位 ${entity.name}。显示当前地图快照；黄色轮廓为区域边界，路径显示中心线，准确宽度可在语义详情中查看。`);
+      });
+      return;
+    }
     if (action === 'close') { this.close(); return; }
     if (action === 'play') { this.manual = false; this.runtime?.setManual(false); if (this.time >= (this.bundle?.duration ?? 0)) this.time = 0; this.playing = !this.playing; this.syncButtons(); return; }
     if (action === 'start') { this.time = 0; this.playing = false; this.syncButtons(); this.draw(); return; }
     if (action === 'manual') { this.playing = false; this.manual = !this.manual; this.runtime?.setManual(this.manual); this.status(this.manual ? '自由机位：左键旋转，右键平移，滚轮缩放。摆好后点击「锁定当前机位」。' : '已回到演出摄影机。'); this.syncButtons(); this.draw(); return; }
+    if (action === 'paths') { this.playing = false; this.pathEditing = !this.pathEditing; this.marking = false; this.root.classList.remove('cg-is-marking'); this.runtime?.setPathEditing(this.pathEditing, point => void this.commitPathEdit(point)); this.status(this.pathEditing ? '动线已显示：先单击选择一条线，再双击进入控制点编辑；编辑中双击曲线可增加途经点。' : '已隐藏动线。'); this.syncButtons(); this.draw(); return; }
     if (action === 'reset-view') { this.manual = false; this.runtime?.setManual(false); this.syncButtons(); this.draw(); return; }
     if (action === 'mark') { this.playing = false; this.marking = !this.marking; this.root.classList.toggle('cg-is-marking', this.marking); if (this.runtime) this.runtime.controls.enabled = this.marking ? false : this.manual || !this.bundle; this.status(this.marking ? '点击场景中的可见表面。Esc 取消标点。' : '已取消标点。'); this.syncButtons(); return; }
-    if (action === 'shot') { this.selectedShot = button.dataset.id!; this.time = this.bundle?.shots.find(shot => shot.id === this.selectedShot)?.start ?? this.time; this.playing = false; this.renderDocument(); this.draw(); return; }
+    if (action === 'shot') { this.selectedBehavior = ''; this.selectedShot = button.dataset.id!; this.time = this.bundle?.shots.find(shot => shot.id === this.selectedShot)?.start ?? this.time; this.playing = false; this.renderDocument(); this.draw(); return; }
+    if (action === 'behavior') { this.selectedBehavior = button.dataset.id!; this.selectedShot = ''; this.time = this.bundle?.actions.find(a => a.id === this.selectedBehavior)?.start ?? this.time; this.playing = false; this.renderDocument(); this.draw(); return; }
     if (action === 'import') { this.el<HTMLInputElement>('file').click(); return; }
     if (action === 'load') { await this.run('正在打开已保存的演出…', async () => {
       const id = this.el<HTMLSelectElement>('projects').value;
       if (!id) { await this.resetScene(this.options.map, this.options.scheme); this.project = null; this.selectedShot = ''; this.text('source', this.options.map.name); this.renderDocument(); this.status('已切换为新建项目；下一次生成将使用进入工作区时的地图快照。'); return; }
       await this.present(await this.request<CgProject>(`/projects/${encodeURIComponent(id)}`), true);
       this.status('项目已恢复。导演文档、资源和已确认版本均保存在本地。');
+    }); return; }
+    if (action === 'sync-map') { await this.run('正在同步 WorldForge 地图并重新编译…', async () => {
+      if (!this.project) throw new Error('请先打开一个 CG 项目。');
+      if (this.project.mapSnapshot.id !== this.options.map.id) throw new Error('当前 WorldForge 地图与这个 CG 项目不是同一张地图。');
+      const result = await this.request<{ project: CgProject; summary: CgMapSyncSummary }>(`/projects/${this.project.id}/sync-map`, { revision: this.project.revision, map: this.options.map, scheme: this.options.scheme });
+      await this.present(result.project, false);
+      await this.resetScene(result.project.mapSnapshot, result.project.schemeSnapshot);
+      this.renderDocument();
+      await this.compile(true);
+      const summary = describeMapSync(result.summary);
+      this.status(this.project?.candidate?.validation.valid
+        ? `WorldForge 地图已同步并重新编译通过：${summary}。导演文档和人工约束已保留。`
+        : `WorldForge 地图已同步：${summary}。新地图与演出存在冲突，请查看诊断；上次确认版本仍保留。`, !this.project?.candidate?.validation.valid);
+      await this.refreshProjects();
     }); return; }
     if (action === 'plan' || action === 'demo') { await this.run(action === 'demo' ? '正在创建内置演出…' : '正在理解剧情与地图…', async () => {
       const prompt = this.el<HTMLTextAreaElement>('prompt').value.trim();
@@ -194,10 +282,10 @@ class CgWorkspace {
       await this.refreshProjects();
     }); return; }
     if (action === 'compile') { await this.run('正在编译演出…', () => this.compile()); return; }
-    if (action === 'refine') { await this.run('正在精修所选镜头…', async () => {
+    if (action === 'refine') { await this.run('正在精修所选行为或镜头…', async () => {
       const prompt = this.el<HTMLTextAreaElement>('refine').value.trim();
       if (!prompt) throw new Error('请描述要修改的内容。');
-      const result = await this.request<{ project: CgProject; operations: CgPatchOperation[] }>(`/projects/${this.project!.id}/refine`, { revision: this.project!.revision, prompt, targetId: this.selectedShot });
+      const result = await this.request<{ project: CgProject; operations: CgPatchOperation[] }>(`/projects/${this.project!.id}/refine`, { revision: this.project!.revision, prompt, targetId: this.selectedBehavior || this.selectedShot });
       await this.present(result.project);
       await this.compile();
       this.el<HTMLTextAreaElement>('refine').value = '';
@@ -240,7 +328,7 @@ class CgWorkspace {
     });
   }
 
-  private async compile(): Promise<void> {
+  private async compile(keepMapSnapshotOnError = false): Promise<void> {
     if (!this.project) throw new Error('请先生成导演文档。');
     this.progressId = window.setInterval(() => {
       if (!this.project || this.closed) return;
@@ -248,7 +336,12 @@ class CgWorkspace {
     }, 1200);
     try {
       const next = await this.request<CgProject>(`/projects/${this.project.id}/compile`, { revision: this.project.revision });
-      await this.present(next, true);
+      if (keepMapSnapshotOnError && !next.candidate?.validation.valid) {
+        await this.present(next, false);
+        await this.resetScene(next.mapSnapshot, next.schemeSnapshot);
+        this.renderDocument();
+        this.draw();
+      } else await this.present(next, true);
       if (next.candidate?.validation.valid) this.status(`编译与验证通过 · ${next.candidate.duration.toFixed(2)} 秒 · ${next.candidate.shots.length} 个镜头 · ${next.candidate.changedNodeIds.length} 个依赖节点更新。预览后可确认。`);
       else this.status('编译发现冲突，请查看诊断并调整。上次确认版本仍然保留。', true);
     } finally { clearInterval(this.progressId); this.progressId = 0; }
@@ -257,7 +350,8 @@ class CgWorkspace {
   private async present(project: CgProject, activate = false): Promise<void> {
     if (this.closed) return;
     this.project = project;
-    if (!project.document.shots.some(shot => shot.id === this.selectedShot)) this.selectedShot = project.document.shots[0]?.id ?? '';
+    if (!project.document.actions.some(a => a.id === this.selectedBehavior)) this.selectedBehavior = '';
+    if (!this.selectedBehavior && !project.document.shots.some(shot => shot.id === this.selectedShot)) this.selectedShot = project.document.shots[0]?.id ?? '';
     if (activate) {
       const candidate = project.candidate?.validation.valid ? project.candidate : project.confirmed;
       if (candidate && this.runtime) {
@@ -266,12 +360,14 @@ class CgWorkspace {
         this.bundle = candidate;
         this.manual = false;
         this.marking = false;
+        this.runtime.setPathEditing(this.pathEditing, point => void this.commitPathEdit(point));
         this.root.classList.remove('cg-is-marking');
         this.time = Math.min(this.time, candidate.duration);
       } else await this.resetScene(project.mapSnapshot, project.schemeSnapshot);
     }
     this.text('source', project.mapSnapshot.name);
     this.renderDocument();
+    this.renderMapSync();
     this.draw();
   }
 
@@ -280,6 +376,7 @@ class CgWorkspace {
     this.time = 0;
     this.manual = false;
     this.marking = false;
+    this.pathEditing = false;
     this.selectedPoint = null;
     this.root.classList.remove('cg-is-marking');
     this.text('point', '尚未标点。点击「场景标点」，再点击场景表面。');
@@ -297,20 +394,32 @@ class CgWorkspace {
     const shot = doc?.shots.find(value => value.id === this.selectedShot);
     this.el('selection').innerHTML = shot ? `<span class="cg-eyebrow">SHOT ${String((doc?.shots.indexOf(shot) ?? 0) + 1).padStart(2, '0')}</span><h2>${escape(shot.name)}</h2><p>${escape(shot.purpose)}</p><div class="cg-chips"><span>${escape(movement[shot.camera.movement])}</span><span>${escape(framing[shot.camera.framing])}</span>${shot.camera.view ? `<span>${escape(cameraView[shot.camera.view])}</span>` : ''}${shot.camera.aim ? `<span>${escape(cameraAim[shot.camera.aim])}</span>` : ''}<span>${seconds(this.effectiveDuration(shot.id))} 秒</span></div>` : '<h2>让意图成为演出</h2><p>选择镜头后，可以调整景别、节奏与机位。</p>';
     if (shot) this.el<HTMLInputElement>('duration').value = String(this.effectiveDuration(shot.id));
+    const behavior = doc?.actions.find(a => a.id === this.selectedBehavior);
+    if (behavior) this.el('selection').innerHTML = `<span class="cg-eyebrow">PERFORMANCE</span><h2>${escape(actionName[behavior.type])}</h2><p>${escape(behavior.purpose ?? behavior.id)}</p><small>行为时长 ${seconds(behavior.duration)} 秒 · 镜头不会改变行为时间</small>`;
+    this.root.querySelectorAll<HTMLButtonElement>('[data-do="refine"]').forEach(button => { button.textContent = behavior ? '✦ 只修改所选行为' : '✦ 只修改所选镜头'; });
     const oldTarget = this.el<HTMLSelectElement>('lock-target').value;
     this.el('lock-target').innerHTML = (doc?.entities.map(entity => `<option value="entity:${escape(entity.id)}">${entity.kind === 'actor' ? '角色起点' : '道具位置'} · ${escape(entity.name)}</option>`).join('') ?? '') + (doc?.actions.filter(action => action.type === 'move').map(action => `<option value="action:${escape(action.id)}">移动终点 · ${escape(doc.entities.find(entity => entity.id === action.entityId)?.name ?? action.entityId)} (${escape(action.id)})</option>`).join('') ?? '');
     if ([...this.el<HTMLSelectElement>('lock-target').options].some(option => option.value === oldTarget)) this.el<HTMLSelectElement>('lock-target').value = oldTarget;
-    const names: Record<string, string> = { 'entity-position': '位置', 'action-target': '终点', 'camera-pose': '机位', 'shot-duration': '时长', 'action-time': '开始时间' };
+    const names: Record<string, string> = { 'entity-position': '位置', 'action-target': '终点', 'action-route': '走位控制点', 'camera-pose': '机位', 'camera-path': '摄影机轨迹', 'shot-duration': '时长', 'action-time': '开始时间' };
     this.el('constraints').innerHTML = doc?.constraints.map(constraint => `<div><span>⌑ ${escape(names[constraint.type])} · ${escape(doc.shots.find(value => value.id === constraint.targetId)?.name ?? doc.entities.find(value => value.id === constraint.targetId)?.name ?? constraint.targetId)}${constraint.seconds === undefined ? '' : ` · ${seconds(constraint.seconds)}s`}</span><button data-do="remove-constraint" data-id="${escape(constraint.id)}" title="移除此人工约束" ${!this.project ? 'disabled' : ''}>×</button></div>`).join('') ?? '';
+    this.renderWorld();
     this.text('document', doc ? JSON.stringify(doc, null, 2) : '等待生成');
+    const performance = this.project?.candidate?.performance ?? this.bundle?.performance;
+    const candidate = this.project?.candidate ?? this.bundle;
+    this.el('performance').innerHTML = performance && candidate ? `<p>演出时长 ${seconds(performance.duration)} 秒 · ${candidate.stage === 'performance' ? '行为阶段，镜头待编译' : '完整编译'}</p>${candidate.actions.filter(a => ['move', 'sit', 'dialogue', 'hold'].includes(a.type)).map(a => `<div><strong>${escape(actionName[a.type])} · ${escape(a.id)}</strong><small>${seconds(a.start)}–${seconds(a.end)} 秒${a.route ? ` · 道路 ${escape(a.route.guideIds.join(', '))}` : ''}${a.contact ? ` · 接触 ${escape(a.contact.objectId)}/${escape(a.contact.nodeId)}` : ''}</small></div>`).join('')}${candidate.shots.map(s => `<div><strong>${escape(s.id)}</strong><small>行为 ${escape(s.behaviorId ?? '未指定')} · 镜头 ${escape(s.skillId ?? '手工意图')}</small></div>`).join('')}` : '当前为旧版或尚未编译的演出。';
     const validation = this.project?.candidate?.validation ?? this.bundle?.validation;
+    if (doc?.schemaVersion === 2) this.el('performance').insertAdjacentHTML('afterbegin', `<div class="cg-chips">${doc.actions.filter(a => ['move', 'sit', 'dialogue', 'hold'].includes(a.type)).map(a => `<button data-do="behavior" data-id="${escape(a.id)}">${escape(actionName[a.type])}</button>`).join('')}</div>`);
     this.el('diagnostics').hidden = !validation?.diagnostics.length;
     this.el('diagnostics').innerHTML = validation?.diagnostics.map(item => `<div class="${item.severity === 'error' ? 'cg-error' : ''}"><strong>${item.severity === 'error' ? '错误' : '提示'} · ${escape(item.code)}</strong> ${escape(item.message)} <small>${escape(item.nodeIds.join(', '))}</small></div>`).join('') ?? '';
     this.renderTimeline();
     this.syncButtons();
   }
 
-  private effectiveDuration(id: string): number { const doc = this.document; return doc?.constraints.find(constraint => constraint.type === 'shot-duration' && constraint.targetId === id)?.seconds ?? doc?.shots.find(shot => shot.id === id)?.duration ?? 0; }
+  private effectiveDuration(id: string): number {
+    const doc = this.document, candidate = this.project?.candidate ?? this.bundle;
+    const resolved = candidate?.documentRevision === doc?.revision ? candidate?.shots.find(s => s.id === id) : undefined;
+    return doc?.constraints.find(c => c.type === 'shot-duration' && c.targetId === id)?.seconds ?? (resolved ? resolved.end - resolved.start : doc?.shots.find(s => s.id === id)?.duration ?? 0);
+  }
 
   private renderTimeline(): void {
     const bundle = this.bundle;
@@ -323,7 +432,7 @@ class CgWorkspace {
 
   private syncButtons(): void {
     const hasDoc = !!this.project?.document.shots.length;
-    const allowed: Record<string, boolean> = { plan: !!this.runtime, demo: !!this.runtime, load: !!this.runtime, import: !!this.runtime, manual: !!this.runtime, mark: !!this.runtime, 'reset-view': !!this.runtime, refine: hasDoc && !!this.selectedShot, compile: hasDoc, confirm: this.current && !!this.project?.candidate?.validation.valid && !this.manual && !this.marking, export: !!this.project?.confirmed, play: !!this.bundle, start: !!this.bundle, 'lock-camera': hasDoc && !!this.selectedShot, 'lock-duration': hasDoc && !!this.selectedShot, 'lock-point': hasDoc && !!this.selectedPoint, 'lock-time': hasDoc && this.el<HTMLSelectElement>('lock-target').value.startsWith('action:'), 'remove-constraint': !!this.project };
+    const allowed: Record<string, boolean> = { plan: !!this.runtime, demo: !!this.runtime, load: !!this.runtime, import: !!this.runtime, 'sync-map': this.mapSyncState === 'changed', manual: !!this.runtime, paths: !!this.bundle && !!this.project, mark: !!this.runtime, 'reset-view': !!this.runtime, refine: hasDoc && !!(this.selectedBehavior || this.selectedShot), compile: hasDoc, confirm: this.current && !!this.project?.candidate?.validation.valid && this.project.candidate.stage !== 'performance' && !this.manual && !this.marking && !this.pathEditing, export: !!this.project?.confirmed, play: !!this.bundle, start: !!this.bundle, 'lock-camera': hasDoc && !!this.selectedShot, 'lock-duration': hasDoc && !!this.selectedShot, 'lock-point': hasDoc && !!this.selectedPoint, 'lock-time': hasDoc && this.el<HTMLSelectElement>('lock-target').value.startsWith('action:'), 'remove-constraint': !!this.project };
     for (const button of this.root.querySelectorAll<HTMLButtonElement>('button[data-do]')) {
       const action = button.dataset.do!;
       if (action !== 'close') button.disabled = this.busy || allowed[action] === false;
@@ -331,10 +440,31 @@ class CgWorkspace {
     this.el<HTMLInputElement>('seek').disabled = !this.bundle || this.busy;
     this.root.querySelectorAll<HTMLButtonElement>('[data-do="play"]').forEach(button => { button.textContent = this.playing ? 'Ⅱ' : '▶'; button.setAttribute('aria-label', this.playing ? '暂停' : '播放'); });
     this.root.querySelectorAll('[data-do="manual"]').forEach(button => button.classList.toggle('active', this.manual));
+    this.root.querySelectorAll('[data-do="paths"]').forEach(button => button.classList.toggle('active', this.pathEditing));
     const candidate = this.project?.candidate;
     const stages: Record<string, boolean> = { document: hasDoc, compile: !!candidate, validate: !!candidate?.validation.valid && this.current, preview: this.current, confirm: !!this.project?.confirmed && this.project.confirmed.id === this.bundle?.id };
     for (const element of this.root.querySelectorAll<HTMLElement>('[data-phase]')) element.classList.toggle('complete', stages[element.dataset.phase!] ?? false);
     this.text('revision', this.project ? `文档 r${this.project.document.revision}${this.bundle ? this.current ? ' · 当前预览' : ' · 预览为先前版本' : ''}` : this.bundle ? '导入演出 · 只读预览' : '未生成');
+    this.renderMapSync();
+  }
+
+  private get worldMap(): EditableMap { return this.project?.mapSnapshot ?? this.bundle?.map ?? this.options.map; }
+  private renderWorld(): void {
+    this.el('world-semantics').innerHTML = renderWorldInspector(buildWorldSemanticIndex(this.worldMap), this.el<HTMLInputElement>('world-filter').value);
+  }
+
+  private get mapSyncState(): 'none' | 'different-map' | 'changed' | 'current' {
+    if (!this.project) return 'none';
+    if (this.project.mapSnapshot.id !== this.options.map.id) return 'different-map';
+    return stableHash({ map: this.project.mapSnapshot, scheme: this.project.schemeSnapshot }) === stableHash({ map: this.options.map, scheme: this.options.scheme }) ? 'current' : 'changed';
+  }
+
+  private renderMapSync(): void {
+    const state = this.mapSyncState;
+    const container = this.el('map-sync');
+    container.classList.toggle('cg-map-sync-changed', state === 'changed');
+    container.classList.toggle('cg-map-sync-blocked', state === 'different-map');
+    this.text('map-sync-text', state === 'changed' ? '检测到 WorldForge 地图有修改' : state === 'current' ? 'CG 已使用当前地图版本' : state === 'different-map' ? '该 CG 属于另一张地图' : '打开项目后检查地图版本');
   }
 
   private loop = (): void => {
@@ -358,9 +488,51 @@ class CgWorkspace {
         this.root.dataset.time = seconds(this.time);
         this.root.dataset.shot = frame.shotId;
         this.root.dataset.compileId = this.bundle.id;
+        const observationKey = `${this.bundle.id}:${this.time.toFixed(2)}:${this.el('view').clientWidth}:${this.el('view').clientHeight}`;
+        if (observationKey !== this.viewObservationKey) {
+          this.viewObservationKey = observationKey;
+          const observation = inspectCgView(this.bundle, this.time, Math.max(0.1, this.el('view').clientWidth / Math.max(1, this.el('view').clientHeight)));
+          this.el('view-semantics').innerHTML = observation.items.slice(0, 8).map(item => `<div><strong>${escape(item.name)}</strong><small>${item.screenRegion === 'left' ? '画面左侧' : item.screenRegion === 'right' ? '画面右侧' : '画面中央'} · 覆盖 ${(item.coverage * 100).toFixed(1)}% · 可见 ${(item.visibleFraction * 100).toFixed(0)}%${item.occludedBy.length ? ` · 遮挡 ${escape(item.occludedBy.join(', '))}` : ''}</small></div>`).join('') || '<p>当前机位中没有可确认的地图物体。</p>';
+        }
       }
-      this.text('view-hint', this.marking ? '点击场景表面记录精确世界坐标' : this.manual || !this.bundle ? '拖动旋转 · 右键平移 · 滚轮缩放' : '演出机位 · 可随时暂停或拖动时间轴');
+      this.text('view-hint', this.marking ? '点击场景表面记录精确世界坐标' : this.pathEditing ? '动线视图 · 单击选线 · 双击编辑或加点 · Esc 退出点编辑' : this.manual || !this.bundle ? '拖动旋转 · 右键平移 · 滚轮缩放' : '演出机位 · 可随时暂停或拖动时间轴');
     } catch (error) { this.playing = false; this.status(`预览失败：${this.message(error)}`, true); }
+  }
+
+  private async commitPathEdit(point: CgEditablePathPoint): Promise<void> {
+    await this.run('正在锁定路线控制点并重新编译…', async () => {
+      if (!this.project) throw new Error('请先打开可编辑项目。');
+      const operations: CgPatchOperation[] = [];
+      if (point.kind === 'camera') {
+        for (const constraint of this.document?.constraints.filter(value => value.type === 'camera-path' && value.targetId === point.targetId) ?? []) operations.push({ type: 'constraint.remove', id: constraint.id });
+        for (const [index, position] of point.path.entries()) {
+          const existingId = point.pointIds[index];
+          const anchorId = existingId?.startsWith('user-') ? existingId : `user-camera-path-${point.targetId}-${index}`;
+          operations.push(
+            { type: 'anchor.upsert', anchor: { id: anchorId, name: `摄影机轨迹 ${index + 1}`, kind: 'point', position, space: 'world' } },
+            { type: 'constraint.upsert', constraint: { id: `camera-path-${point.targetId}-${index}`, source: 'user', strength: 'hard', type: 'camera-path', targetId: point.targetId, anchorId, order: index } }
+          );
+        }
+      } else {
+        const indices = point.operation === 'insert' ? point.path.map((_, index) => index).slice(1) : [point.index];
+        if (point.operation === 'insert') for (const constraint of this.document?.constraints.filter(value => ['action-route', 'action-target'].includes(value.type) && value.targetId === point.targetId) ?? []) operations.push({ type: 'constraint.remove', id: constraint.id });
+        for (const index of indices) {
+          const isEnd = index === point.count - 1;
+          const existingId = point.pointIds[index];
+          const anchorId = existingId?.startsWith('user-') ? existingId : `user-actor-route-${point.targetId}-${isEnd ? 'end' : index}`;
+          const existingConstraint = this.document?.constraints.find(value => value.targetId === point.targetId && value.anchorId === existingId && value.type === (isEnd ? 'action-target' : 'action-route'));
+          const constraintId = existingConstraint?.id ?? (isEnd ? `route-target-${point.targetId}` : `route-via-${point.targetId}-${anchorId}`);
+          operations.push(
+            { type: 'anchor.upsert', anchor: { id: anchorId, name: isEnd ? '用户指定移动终点' : `用户指定走位点 ${index + 1}`, kind: 'point', position: point.path[index], space: 'world' } },
+            { type: 'constraint.upsert', constraint: { id: constraintId, source: 'user', strength: 'hard', type: isEnd ? 'action-target' : 'action-route', targetId: point.targetId, anchorId, ...(isEnd ? {} : { order: index }) } }
+          );
+        }
+      }
+      await this.present(await this.request<CgProject>(`/projects/${this.project.id}/patch`, { revision: this.project.revision, operations }));
+      await this.compile();
+      this.pathEditing = true;
+      this.runtime?.setPathEditing(true, next => void this.commitPathEdit(next));
+    });
   }
 
   private async refreshProjects(): Promise<void> {

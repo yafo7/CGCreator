@@ -8,7 +8,7 @@ const one = (v: unknown, values: string[]) => typeof v === 'string' && values.in
 export const CG_WORLD_OPERATIONS = ['object.add', 'object.update', 'object.remove', 'terrain.set', 'terrain.brush', 'room.set', 'sun.set', 'reference.set'];
 
 /** Validate intent without coercion, generated defaults, truncation, or mutation. */
-export function validateDirectorDocument(value: unknown): CgValidation {
+export function validateDirectorDocument(value: unknown, options: { allowNoShots?: boolean } = {}): CgValidation {
   const diagnostics: CgDiagnostic[] = [];
   const error = (message: string, nodeId = '', code = 'invalid_document') => diagnostics.push({ severity: 'error', code, message, nodeIds: nodeId ? [nodeId] : [] });
   if (!record(value)) return { valid: false, diagnostics: [{ severity: 'error', code: 'invalid_document', message: 'DirectorDocument must be an object.', nodeIds: [] }] };
@@ -17,13 +17,14 @@ export function validateDirectorDocument(value: unknown): CgValidation {
     for (const key of Object.keys(o)) if (!allowed.includes(key)) error(`Unsupported field ${label}.${key}.`, String(o.id ?? ''), 'unsupported_field');
   };
   keys(d, ['schemaVersion', 'id', 'title', 'sourcePrompt', 'revision', 'seed', 'mapId', 'entities', 'anchors', 'shots', 'actions', 'constraints', 'worldPatch'], 'document');
-  if (d.schemaVersion !== 1 || !id(d.id) || !id(d.mapId)) error('schemaVersion must be 1; document and map IDs must be stable identifiers.');
+  if (![1, 2].includes(d.schemaVersion) || !id(d.id) || !id(d.mapId)) error('schemaVersion must be 1 or 2; document and map IDs must be stable identifiers.');
   if (typeof d.title !== 'string' || typeof d.sourcePrompt !== 'string') error('title and sourcePrompt must be strings.');
   if (!Number.isSafeInteger(d.revision) || d.revision < 0 || !Number.isSafeInteger(d.seed)) error('revision must be a nonnegative integer and seed a safe integer.');
   const limits: Record<string, number> = { entities: 64, anchors: 256, shots: 128, actions: 512, constraints: 512, worldPatch: 256 };
   for (const [key, limit] of Object.entries(limits)) if (!Array.isArray(d[key]) || d[key].length > limit) error(`${key} must be an array with at most ${limit} entries.`);
   if (diagnostics.length) return { valid: false, diagnostics };
-  if (!d.shots.length || !d.entities.length) error('At least one shot and one entity are required.');
+  if ((!d.shots.length && !options.allowNoShots) || !d.entities.length) error('At least one shot and one entity are required.');
+  if (d.schemaVersion === 2 && !d.actions.length) error('V2 requires a performance before camera coverage.');
   const seen = new Set<string>();
   for (const key of ['entities', 'anchors', 'shots', 'actions', 'constraints']) {
     for (const item of d[key]) {
@@ -46,7 +47,17 @@ export function validateDirectorDocument(value: unknown): CgValidation {
     if (e.height !== undefined && (!finite(e.height) || e.height <= 0 || e.height > 100)) error('Entity height must be in (0,100] metres.', e.id);
   }
   for (const a of d.anchors) {
-    keys(a, ['id', 'name', 'kind', 'position', 'quaternion', 'fov', 'space', 'objectId'], 'anchor');
+    keys(a, ['id', 'name', 'kind', 'position', 'quaternion', 'fov', 'space', 'objectId', ...(d.schemaVersion === 2 ? ['binding'] : [])], 'anchor');
+    if (a.binding !== undefined) {
+      if (!record(a.binding) || a.space !== 'world') error('Invalid spatial anchor binding.', a.id);
+      else if (a.binding.kind === 'guide') {
+        keys(a.binding, ['kind', 'guideId', 'progress'], 'binding');
+        if (!id(a.binding.guideId) || !finite(a.binding.progress) || a.binding.progress < 0 || a.binding.progress > 1) error('Invalid guide binding.', a.id);
+      } else if (a.binding.kind === 'seat-approach') {
+        keys(a.binding, ['kind', 'objectId', 'nodeId'], 'binding');
+        if (!id(a.binding.objectId) || !id(a.binding.nodeId)) error('Invalid seat approach binding.', a.id);
+      } else error('Unsupported spatial binding.', a.id);
+    }
     if (!one(a.kind, ['point', 'camera']) || typeof a.name !== 'string' || !vec(a.position)) error('Anchor requires a name, kind and finite position.', a.id);
     if (a.space !== undefined && !one(a.space, ['world', 'object'])) error('Anchor space is invalid.', a.id);
     if (a.space === 'object' && !id(a.objectId)) error('Object-space anchor requires objectId.', a.id);
@@ -55,11 +66,19 @@ export function validateDirectorDocument(value: unknown): CgValidation {
     if (a.fov !== undefined && (!finite(a.fov) || a.fov <= 1 || a.fov >= 160)) error('Camera FOV must be between 1 and 160 degrees.', a.id);
   }
   for (const s of d.shots) {
-    keys(s, ['id', 'name', 'purpose', 'duration', 'camera', 'transition', 'subtitle'], 'shot');
+    keys(s, ['id', 'name', 'purpose', 'duration', 'camera', 'transition', 'subtitle', ...(d.schemaVersion === 2 ? ['behaviorId', 'skillId', 'coveragePurpose', 'autoDuration'] : [])], 'shot');
+    if (s.autoDuration !== undefined && (typeof s.autoDuration !== 'boolean' || s.autoDuration && !s.behaviorId)) error('Automatic coverage duration requires a behavior binding.', s.id);
+    if (s.behaviorId !== undefined && !actions.has(s.behaviorId)) error('Coverage refers to a missing behavior.', s.id, 'missing_behavior');
+    if (s.skillId !== undefined && !id(s.skillId)) error('Camera skill must have a stable ID.', s.id);
+    if (s.coveragePurpose !== undefined && !one(s.coveragePurpose, ['geography', 'follow', 'destination', 'emotion', 'dialogue', 'reaction', 'contact'])) error('Unknown coverage purpose.', s.id);
     if (typeof s.name !== 'string' || typeof s.purpose !== 'string' || !finite(s.duration) || s.duration <= 0 || s.duration > 300) error('Shot requires name/purpose and duration in (0,300].', s.id);
     if (!record(s.camera)) { error('Shot requires a camera intent.', s.id); continue; }
     const c = s.camera;
-    keys(c, ['movement', 'framing', 'subjectId', 'secondaryId', 'side', 'lensMm', 'distance', 'height', 'azimuth', 'reference', 'view', 'aim', 'screenPosition'], 'camera');
+    keys(c, ['movement', 'framing', 'subjectId', 'secondaryId', 'side', 'lensMm', 'distance', 'height', 'azimuth', 'reference', 'view', 'aim', 'screenPosition', ...(d.schemaVersion === 2 ? ['layout', 'aimMode', 'pitch'] : [])], 'camera');
+    if (c.layout !== undefined && !one(c.layout, ['solo', 'two-shot', 'over-shoulder'])) error('Unknown camera layout.', s.id);
+    if (['two-shot', 'over-shoulder'].includes(c.layout) && (!c.secondaryId || c.secondaryId === c.subjectId)) error('Two-person composition requires distinct subjects.', s.id);
+    if (c.aimMode !== undefined && !one(c.aimMode, ['fixed', 'follow'])) error('Unknown camera aim mode.', s.id);
+    if (c.pitch !== undefined && (!finite(c.pitch) || Math.abs(c.pitch) > Math.PI / 2 - 0.01)) error('Camera pitch must be within the supported radians range.', s.id);
     if (!one(c.movement, ['static', 'dolly', 'tracking', 'orbit']) || !one(c.framing, ['wide', 'medium', 'close-up', 'over-shoulder'])) error('Unsupported camera movement or framing.', s.id, 'unsupported_camera');
     if (!entities.has(c.subjectId) || (c.secondaryId !== undefined && !entities.has(c.secondaryId))) error('Camera references an unknown entity.', s.id, 'missing_reference');
     if (c.framing === 'over-shoulder' && (!c.secondaryId || c.secondaryId === c.subjectId)) error('Over-shoulder needs two distinct entity IDs.', s.id);
@@ -86,9 +105,29 @@ export function validateDirectorDocument(value: unknown): CgValidation {
     if (s.subtitle !== undefined && typeof s.subtitle !== 'string') error('Subtitle must be a string.', s.id);
   }
   for (const a of d.actions) {
-    keys(a, ['id', 'entityId', 'type', 'start', 'duration', 'targetAnchorId', 'targetEntityId', 'clipId', 'visible', 'effect', 'socketId'], 'action');
+    keys(a, ['id', 'entityId', 'type', 'start', 'duration', 'targetAnchorId', 'targetEntityId', 'clipId', 'visible', 'effect', 'socketId', ...(d.schemaVersion === 2 ? ['route', 'interaction', 'endBehavior', 'purpose'] : [])], 'action');
     if (!entities.has(a.entityId)) error('Action references an unknown entity.', a.id, 'missing_reference');
-    if (!one(a.type, ['move', 'face', 'animate', 'visibility', 'effect', 'attach', 'detach'])) error('Unknown action type.', a.id, 'unsupported_action');
+    if (!one(a.type, ['move', 'face', 'animate', 'visibility', 'effect', 'attach', 'detach', ...(d.schemaVersion === 2 ? ['sit', 'dialogue', 'hold'] : [])])) error('Unknown action type.', a.id, 'unsupported_action');
+    if (a.purpose !== undefined && (typeof a.purpose !== 'string' || a.purpose.length > 2000)) error('Behavior purpose must be a bounded string.', a.id);
+    if (a.route !== undefined) {
+      if (a.type !== 'move' || !record(a.route)) error('Only a move can declare a route.', a.id);
+      else {
+        keys(a.route, ['guideIds', 'policy', 'locomotion', 'maxSpeed'], 'route');
+        if (!Array.isArray(a.route.guideIds) || !a.route.guideIds.length || a.route.guideIds.length > 16 || !a.route.guideIds.every(id) || new Set(a.route.guideIds).size !== a.route.guideIds.length) error('Route requires 1–16 unique guide IDs.', a.id);
+        if (!one(a.route.policy, ['required', 'preferred']) || !one(a.route.locomotion, ['walk', 'run'])) error('Invalid route policy or locomotion.', a.id);
+        if (a.route.maxSpeed !== undefined && (!finite(a.route.maxSpeed) || a.route.maxSpeed <= 0 || a.route.maxSpeed > 15)) error('Invalid route maximum speed.', a.id);
+      }
+    }
+    if (a.endBehavior !== undefined && (!['animate', 'sit'].includes(a.type) || !one(a.endBehavior, ['restore', 'hold']))) error('Unsupported end-pose behavior.', a.id);
+    if (a.type === 'sit') {
+      if (!id(a.clipId) || !record(a.interaction)) error('Sit requires a baked clip and a seat interaction binding.', a.id);
+      else {
+        keys(a.interaction, ['objectId', 'seatNodeId', 'approachAnchorId'], 'interaction');
+        if (!id(a.interaction.objectId) || !id(a.interaction.seatNodeId) || !anchors.has(a.interaction.approachAnchorId)) error('Sit requires exact object/node and approach references.', a.id);
+      }
+      if (!finite(a.duration) || a.duration <= 0 || a.endBehavior === 'restore') error('Sit needs positive duration and a persistent seated pose.', a.id);
+    } else if (a.interaction !== undefined) error('Only sit currently supports an interaction binding.', a.id);
+    if (a.type === 'dialogue' && (!entities.has(a.targetEntityId) || a.targetEntityId === a.entityId)) error('Dialogue requires another known participant.', a.id);
     if (!finite(a.duration) || a.duration < 0 || a.duration > 1200 || (['move', 'animate', 'effect'].includes(a.type) && a.duration === 0)) error('Action duration is invalid.', a.id);
     if (!record(a.start)) error('Action start must be a temporal reference.', a.id);
     else {
@@ -98,6 +137,7 @@ export function validateDirectorDocument(value: unknown): CgValidation {
       } else if (one(a.start.kind, ['after', 'with'])) {
         if (!actions.has(a.start.id) && !shots.has(a.start.id)) error('Unknown temporal reference.', a.id, 'missing_reference');
         if (a.start.offset !== undefined && !finite(a.start.offset)) error('Temporal offset must be finite.', a.id);
+        if (d.schemaVersion === 2 && shots.has(a.start.id)) error('V2 behavior timing cannot depend on camera shots.', a.id, 'camera_owns_behavior_time');
       } else error('Unknown temporal reference kind.', a.id);
     }
     if (a.targetAnchorId !== undefined && !anchors.has(a.targetAnchorId)) error('Unknown target anchor.', a.id, 'missing_reference');
@@ -110,12 +150,12 @@ export function validateDirectorDocument(value: unknown): CgValidation {
     if (a.type === 'attach' || a.type === 'detach') error('Socket attachment requires a verified named-node binding and is not supported by this compiler version.', a.id, 'unsupported_attachment');
   }
   for (const c of d.constraints) {
-    keys(c, ['id', 'source', 'strength', 'type', 'targetId', 'anchorId', 'seconds', 'edge', 'scope'], 'constraint');
+    keys(c, ['id', 'source', 'strength', 'type', 'targetId', 'anchorId', 'seconds', 'edge', 'scope', 'order'], 'constraint');
     if (c.source !== 'user' || c.strength !== 'hard') error('Constraints must be user-authored hard constraints.', c.id);
-    if (!one(c.type, ['entity-position', 'action-target', 'camera-pose', 'action-time', 'shot-duration'])) error('Unknown constraint type.', c.id);
-    const table = c.type === 'entity-position' ? entities : ['camera-pose', 'shot-duration'].includes(c.type) ? shots : actions;
+    if (!one(c.type, ['entity-position', 'action-target', 'action-route', 'camera-pose', 'camera-path', 'action-time', 'shot-duration'])) error('Unknown constraint type.', c.id);
+    const table = c.type === 'entity-position' ? entities : ['camera-pose', 'camera-path', 'shot-duration'].includes(c.type) ? shots : actions;
     if (!table.has(c.targetId)) error('Constraint target is unknown or has the wrong type.', c.id, 'missing_reference');
-    if (['entity-position', 'action-target', 'camera-pose'].includes(c.type)) {
+    if (['entity-position', 'action-target', 'action-route', 'camera-pose', 'camera-path'].includes(c.type)) {
       const anchor = anchors.get(c.anchorId);
       if (!anchor) error('Constraint requires a valid anchor.', c.id, 'missing_reference');
       else if (c.type === 'camera-pose' && anchor.kind !== 'camera') error('Camera-pose requires a camera anchor.', c.id);
@@ -124,6 +164,8 @@ export function validateDirectorDocument(value: unknown): CgValidation {
     if (c.edge !== undefined && (c.type !== 'action-time' || !one(c.edge, ['start', 'end']))) error('edge is supported only for action-time constraints.', c.id);
     if (c.scope !== undefined && (c.type !== 'entity-position' || !one(c.scope, ['initial', 'throughout']))) error('scope is supported only for entity-position constraints.', c.id);
     if (c.type === 'action-target' && actions.get(c.targetId)?.type !== 'move') error('Action-target constraints require a move action.', c.id);
+    if (c.type === 'action-route' && actions.get(c.targetId)?.type !== 'move') error('Action-route constraints require a move action.', c.id);
+    if (['action-route', 'camera-path'].includes(c.type) && (!Number.isSafeInteger(c.order) || c.order < 0 || c.order > 1024)) error('Route constraints require an integer order in [0,1024].', c.id);
   }
   for (const op of d.worldPatch) {
     if (!record(op) || !CG_WORLD_OPERATIONS.includes(op.type)) { error('Unsupported WorldPatch operation.', '', 'unsupported_world_operation'); continue; }

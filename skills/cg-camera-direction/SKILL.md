@@ -5,6 +5,8 @@ description: Author semantic camera intent for CGCreator shots, grounded in the 
 
 # CGCreator camera direction
 
+V2 coverage is selected after performance validation. Inspect actual behavior intervals, root trajectories, dynamic eye positions, seated state and contact events. Choose from the service-provided registered shot skills by purpose and participants. Dialogue can use two-shot, OTS or reaction coverage; travel can use rear/side follows or an establishing view. Camera layout, position movement and aimMode are independent. A static position can follow dynamic eyes. Contact shots must not conceal failed seating. Coverage replies cannot change actor behavior or timing. Numerical view observations are oriented-box/terrain samples, not pixel-perfect image understanding.
+
 This is original project guidance informed by the sources listed in `../../docs/cgcreator-sources.md`. It is not a copied or vendored third-party skill bundle.
 
 Use when planning or refining a CGCreator camera shot. First inspect the entity IDs, their bounds, the scene geometry, current shot, and user constraints. Express intent in `CgCameraIntent`; do not author arbitrary keyframes.
@@ -19,5 +21,6 @@ Use when planning or refining a CGCreator camera shot. First inspect the entity 
 - User camera pose constraints override automatic positioning, orientation, and lens. Do not adjust the pose to hide a collision or improve composition. Explain conflicts through diagnostics.
 - A camera-only refinement preserves actor movement, resource IDs, and unrelated shots. Keep stable shot IDs. Timing changes invalidate dependent nodes rather than regenerating the story.
 - Validate geometry and preview the beginning, middle, end, and cuts. A mathematically valid pose still needs human visual approval for composition.
+- Read measured `CgViewObservation` samples when available. Use screen bounds, coverage and likely occluders as evidence for a focused revision; do not treat these measurements as an automatic artistic verdict.
 
 The skill supplies directing guidance; `cgCompiler` is responsible for solving geometry, enforcing constraints, and producing deterministic playback.

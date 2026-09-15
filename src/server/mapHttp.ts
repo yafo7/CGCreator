@@ -63,9 +63,6 @@ import type { ProjectExportProfile } from '../shared/projectExport';
 import { applyPaletteToModelJson, type ColorPalette } from '../shared/colorPalette';
 import { worldCapabilitySummary } from '../shared/worldCapabilities';
 import { WorldAgentRunManager } from './worldAgentRuns';
-import { normalizeDirectorReferences, type DirectorReferenceContext } from '../shared/director';
-import { generateDirectorPlan } from './directorAgent';
-import type { CinematicDocument } from '../shared/cinematic';
 
 type Req = http.IncomingMessage;
 type Res = http.ServerResponse;
@@ -155,11 +152,6 @@ async function handleEditorRoute(req: Req, res: Res, store: MapStore, parts: str
 
   if (parts[2] === 'maps') {
     await handleEditorMaps(req, res, store, parts);
-    return;
-  }
-
-  if (parts[2] === 'cinematics') {
-    await handleEditorCinematics(req, res, store, parts);
     return;
   }
 
@@ -373,26 +365,6 @@ async function handleEditorMaps(req: Req, res: Res, store: MapStore, parts: stri
     } catch (error) {
       throw worldAgentHttpError(error);
     }
-    return;
-  }
-
-  if (parts[4] === 'director' && parts[5] === 'plan' && req.method === 'POST' && parts.length === 6) {
-    const body = await readJson<{
-      prompt?: string;
-      provider?: ChatProvider;
-      references?: DirectorReferenceContext;
-    }>(req);
-    const prompt = body.prompt?.trim() ?? '';
-    if (!prompt) throw new HttpError(400, 'missing_director_prompt');
-    const provider = body.provider ?? 'gpt';
-    const option = CHAT_PROVIDER_OPTIONS.find((item) => item.key === provider);
-    if (!option || option.disabled) throw new HttpError(400, 'provider_unavailable');
-    const map = await store.loadMap(mapId);
-    const plan = await generateDirectorPlan(prompt, map, {
-      provider,
-      references: normalizeDirectorReferences(body.references)
-    });
-    sendJson(res, 200, { plan });
     return;
   }
 
@@ -846,43 +818,6 @@ async function handleEditorMaps(req: Req, res: Res, store: MapStore, parts: stri
   throw new HttpError(404, 'not_found');
 }
 
-async function handleEditorCinematics(req: Req, res: Res, store: MapStore, parts: string[]): Promise<void> {
-  if (req.method === 'GET' && parts.length === 3) {
-    const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`);
-    const projectId = url.searchParams.get('projectId')?.trim() || undefined;
-    sendJson(res, 200, { cinematics: await store.listCinematicSummaries(projectId) });
-    return;
-  }
-  if (req.method === 'POST' && parts.length === 3) {
-    const body = await readJson<{ projectId?: string; cinematic?: CinematicDocument }>(req);
-    sendJson(res, 201, { cinematic: await store.saveCinematic(body.cinematic ?? body, body.projectId) });
-    return;
-  }
-  const projectId = parts[3];
-  const cinematicId = parts[4];
-  if (!projectId || !cinematicId || parts.length !== 5) throw new HttpError(404, 'not_found');
-  if (req.method === 'GET') {
-    const cinematic = await store.loadCinematic(projectId, cinematicId);
-    const summary = (await store.listCinematicSummaries(projectId)).find((item) => item.id === cinematic.id);
-    sendJson(res, 200, { cinematic, summary: summary ?? null });
-    return;
-  }
-  if (req.method === 'PUT') {
-    const body = await readJson<{ cinematic?: CinematicDocument }>(req);
-    const current = body.cinematic ?? body;
-    sendJson(res, 200, {
-      cinematic: await store.saveCinematic({ ...current, id: cinematicId, projectId }, projectId)
-    });
-    return;
-  }
-  if (req.method === 'DELETE') {
-    await store.deleteCinematic(projectId, cinematicId);
-    sendJson(res, 200, { ok: true });
-    return;
-  }
-  throw new HttpError(404, 'not_found');
-}
-
 async function handleEditorObjects(req: Req, res: Res, store: MapStore, parts: string[], mapId: string): Promise<void> {
   if (req.method === 'POST' && parts.length === 5) {
     sendJson(res, 201, { map: await store.addObject(mapId, await readJson(req)) });
@@ -968,7 +903,6 @@ async function handleEditorProjectExport(req: Req, res: Res, store: MapStore, pa
     profileId?: string;
     mapFolder?: string;
     renderSchemeId?: string;
-    cinematicProjectId?: string;
     overwritePaths?: string[];
   }>(req);
   const { profile, plan } = await prepareProjectExport(store, body);
@@ -999,7 +933,7 @@ async function handleEditorProjectExport(req: Req, res: Res, store: MapStore, pa
 
 async function prepareProjectExport(
   store: MapStore,
-  input: { mapId?: string; profileId?: string; mapFolder?: string; renderSchemeId?: string; cinematicProjectId?: string }
+  input: { mapId?: string; profileId?: string; mapFolder?: string; renderSchemeId?: string }
 ): Promise<{ profile: ProjectExportProfile; plan: ProjectExportPlan }> {
   if (!input.mapId || !input.profileId) throw new HttpError(400, 'project_export_map_and_profile_required');
   const profile = (await store.listProjectExportProfiles()).find((item) => item.id === input.profileId);
@@ -1015,13 +949,9 @@ async function prepareProjectExport(
   const hdri = hdriFile && hdriPath
     ? { file: hdriFile, bytes: new Uint8Array(await readFile(hdriPath)) }
     : undefined;
-  const cinematicSummaries = await store.listCinematicSummaries(input.cinematicProjectId);
-  const cinematics = await Promise.all(cinematicSummaries
-    .filter((summary) => summary.mapId === map.id)
-    .map((summary) => store.loadCinematic(summary.projectId, summary.id)));
   return {
     profile,
-    plan: buildProjectExportPlan({ map, renderScheme, profile, mapFolder: input.mapFolder, hdri, cinematics })
+    plan: buildProjectExportPlan({ map, renderScheme, profile, mapFolder: input.mapFolder, hdri })
   };
 }
 

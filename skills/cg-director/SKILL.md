@@ -5,7 +5,11 @@ description: Plan or refine a structured, editable CGCreator realtime cutscene f
 
 # CGCreator director
 
+For new projects use DirectorDocument schemaVersion 2. Actions are the authoritative high-level performance plan: road-constrained move (with its own gait clip), dialogue staging, sit, hold and the existing primitives. V2 action times reference actions, never camera shots. Return shots:[] for a new performance; the service creates stable coverage slots, validates the solved performance, then asks for camera-only coverage choices. Never hide a behavior failure with a different camera. Read `../cg-spatial-direction/SKILL.md` for location and contact limits and the registered camera skill catalog supplied by the service. Unsupported stand/IK/speech remains unsupported.
+
 Read the current project before changing it: map snapshot, semantic entities, resources, DirectorDocument revision, hard constraints, candidate validation, and confirmed bundle identity.
+
+Use `cg-spatial-direction` when the request depends on named locations, model parts, actor routes, camera paths, or what a camera currently sees.
 
 1. Ground every reference in a stable map object, asset, entity, anchor, shot, or action ID. Request missing models or clips with descriptions through the resource adapter. Never invent an already available resource.
 2. Produce a `DirectorDocument` with separate shot and action lists. A shot expresses purpose, framing, subject, movement, and duration. Actions express movement, facing, in-place animation, visibility, and supported effects with absolute or relative timing.

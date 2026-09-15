@@ -1,13 +1,19 @@
 import { describe, expect, it } from 'vitest';
 import { Object3D, Euler, Quaternion } from 'three';
-import { applyCgClip } from '../src/client/cgRuntime';
-import { createPointConstraintPatch, parseCgTarget } from '../src/client/cgWorkspace';
+import { applyCgClip, cgFilmViewport } from '../src/client/cgRuntime';
+import { createPointConstraintPatch, describeMapSync, parseCgTarget } from '../src/client/cgWorkspace';
 import { createDemo } from '../src/server/cgService';
 import { createEmptyMap } from '../src/shared/map';
 import { applyDirectorPatch } from '../src/shared/cgCompiler';
 import type { CgClip, DirectorDocument } from '../src/shared/cgTypes';
 
 describe('CG model-local sampling and manual point contracts', () => {
+  it('keeps V2 camera validation and preview in the same 16:9 film gate', () => {
+    const wide = cgFilmViewport(900, 400, true), tall = cgFilmViewport(400, 900, true);
+    expect(wide.width / wide.height).toBeCloseTo(16 / 9); expect(wide.left).toBeGreaterThan(0);
+    expect(tall.width / tall.height).toBeCloseTo(16 / 9); expect(tall.top).toBeGreaterThan(0);
+    expect(cgFilmViewport(900, 400, false)).toEqual({ width: 900, height: 400, left: 0, top: 0 });
+  });
   it('adds baked XYZ Euler channels to rest pose and restores after arbitrary seeks', () => {
     const node = new Object3D(); node.rotation.set(0.3, -0.4, 0.2); node.position.set(2, 3, 4);
     const base = { node, rotation: node.rotation.clone(), quaternion: node.quaternion.clone(), position: node.position.clone(), scale: node.scale.clone() };
@@ -35,5 +41,11 @@ describe('CG model-local sampling and manual point contracts', () => {
     const patched = applyDirectorPatch(document, ops);
     expect(patched.constraints[0]).toMatchObject({ type: 'action-target', targetId: 'walk:to:point' });
     expect(patched.constraints[0]).not.toHaveProperty('scope');
+  });
+  it('describes WorldForge map synchronization with actionable change counts', () => {
+    expect(describeMapSync({
+      addedObjectIds: ['tree'], removedObjectIds: ['rock'], changedObjectIds: ['pavilion'], changedAssetIds: ['tree-asset'], worldChanged: true, schemeChanged: false
+    })).toBe('新增 1 个物体、移除 1 个物体、修改 1 个物体、更新 1 个资源、地形或场景结构已更新');
+    expect(describeMapSync({ addedObjectIds: [], removedObjectIds: [], changedObjectIds: [], changedAssetIds: [], worldChanged: false, schemeChanged: false })).toBe('快照元数据已更新');
   });
 });

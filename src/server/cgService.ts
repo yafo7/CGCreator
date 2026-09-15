@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import type { CgClip, CgPatchOperation, CgProgress, CgProject, CgResources, CgVec3, DirectorDocument } from '../shared/cgTypes';
+import type { CgClip, CgMapSyncSummary, CgPatchOperation, CgProgress, CgProject, CgResources, CgVec3, DirectorDocument } from '../shared/cgTypes';
 import { applyDirectorPatch, compileDirector } from '../shared/cgCompiler';
 import { stableHash, validateDirectorDocument } from '../shared/cgValidation';
 import { getMapBounds, getMapObjectAabbs, getObjectWorldTransforms, sampleTerrainHeight, type EditableMap, type MapAsset } from '../shared/map';
@@ -9,6 +9,12 @@ import { MODEL_API_BASE } from '../shared/protocol';
 import { generateModel, llmChat, type ChatMessage } from './modelApi';
 import { CgHttpError, CgStore } from './cgStore';
 import { CG_CAMERA_GRAMMAR_PROMPT } from '../shared/cgCameraGrammar';
+import { buildWorldSemanticIndex } from '../shared/cgWorldSemantics';
+import { inspectShotSamples } from '../shared/cgViewSemantics';
+import { CG_WORLD_READING_PROMPT, queryWorld, worldSummary } from '../shared/cgWorldQuery';
+import { CG_COVERAGE_PROMPT, CG_SHOT_SKILLS, createBehaviorCoverage, performanceForDirector } from '../shared/cgShotSkills';
+import { createFoundationDemo } from '../shared/cgFoundationDemo';
+import { mapSpatialAnchors } from '../shared/cgSpatialBindings';
 
 export interface CgServiceOptions {
   chat?: (messages: ChatMessage[]) => Promise<string>;
@@ -23,11 +29,39 @@ export class CgService {
   readonly progress = new Map<string, Progress>();
   constructor(readonly store: CgStore, private options: CgServiceOptions = {}) {}
 
+  async foundationDemo(): Promise<CgProject> {
+    const fixture = createFoundationDemo(), id = `cg_${randomUUID()}`;
+    fixture.document.id = `director_${randomUUID()}`;
+    const candidate = compileDirector(fixture.document, fixture.map, null, fixture.resources);
+    if (!candidate.validation.valid) fail('foundation_demo_failed', candidate.validation.diagnostics.map(d => d.message).join('\n'));
+    return this.store.create({ schemaVersion: 1, id, title: fixture.document.title, revision: 0, mapSnapshot: fixture.map, schemeSnapshot: null, document: fixture.document, resources: fixture.resources, candidate, confirmed: null, coveragePending: false, updatedAt: Date.now() });
+  }
+
   async create(map: EditableMap, scheme: RenderScheme | null, title?: string): Promise<CgProject> {
-    if (!map || !/^[a-zA-Z0-9][a-zA-Z0-9:_-]{0,119}$/.test(map.id) || !Array.isArray(map.objects) || !map.box || !map.terrain || !Array.isArray(map.terrain.heights)) fail('invalid_map', '请提供完整的 WorldForge 地图快照。');
+    this.assertMap(map);
     const id = `cg_${randomUUID()}`;
     const document: DirectorDocument = { schemaVersion: 1, id: `director_${randomUUID()}`, title: title?.trim() || `${map.name} · CG`, sourcePrompt: '', revision: 0, seed: map.seed, mapId: map.id, entities: [], anchors: [], shots: [], actions: [], constraints: [], worldPatch: [] };
     return this.store.create({ schemaVersion: 1, id, title: document.title, revision: 0, mapSnapshot: clone(map), schemeSnapshot: clone(scheme), document, resources: { models: [], clips: [] }, candidate: null, confirmed: null, updatedAt: Date.now() });
+  }
+
+  async syncMap(id: string, revision: number, map: EditableMap, scheme: RenderScheme | null): Promise<{ project: CgProject; summary: CgMapSyncSummary }> {
+    this.assertMap(map);
+    let summary!: CgMapSyncSummary;
+    const project = await this.store.transaction(id, revision, (project) => {
+      if (map.id !== project.mapSnapshot.id || map.id !== project.document.mapId) fail('map_mismatch', '当前 WorldForge 地图与这个 CG 项目不是同一张地图。');
+      summary = summarizeMapSync(project.mapSnapshot, map, project.schemeSnapshot, scheme);
+      project.mapSnapshot = clone(map);
+      project.schemeSnapshot = clone(scheme);
+      project.candidate = null;
+      project.mapSync = {
+        sourceMapVersion: map.version,
+        sourceMapUpdatedAt: map.updatedAt,
+        sourceHash: stableHash({ map, scheme }),
+        syncedAt: Date.now(),
+        summary: clone(summary)
+      };
+    });
+    return { project, summary };
   }
 
   async plan(id: string, revision: number, prompt: string, demo = false) {
@@ -41,13 +75,19 @@ export class CgService {
         project.resources = result.resources;
       } else {
         const semantic = buildSemanticContext(project.mapSnapshot);
-        const answer = parseJson(await this.chat([
+        const answer = await this.directorAnswer([
           { role: 'system', content: DIRECTOR_SYSTEM_PROMPT },
           { role: 'user', content: JSON.stringify({ intent: prompt, map: semantic, documentIdentity: { id: project.document.id, mapId: project.mapSnapshot.id, revision: project.document.revision + 1, seed: project.document.seed }, existingDocument: project.document.shots.length ? project.document : null }) }
-        ]));
+        ], project.mapSnapshot);
         assertSupportedAnswer(answer, 'unsupported_intent');
         document = answer as DirectorDocument;
         if (!document || document.id !== project.document.id || document.mapId !== project.mapSnapshot.id || document.revision !== project.document.revision + 1) fail('invalid_ai_identity', 'AI 返回的文档版本或地图引用不正确。');
+        if (document.schemaVersion === 2) {
+          const draftValidation = validateDirectorDocument(document, { allowNoShots: true });
+          if (!draftValidation.valid) fail('invalid_performance_plan', draftValidation.diagnostics.map(d => d.message).join('\n'));
+          if (!document.shots.length) document.shots = createBehaviorCoverage(document);
+          project.coveragePending = true;
+        } else project.coveragePending = false;
         this.assertDocument(document);
         const knownObjects = new Set(project.mapSnapshot.objects.map((o) => o.id));
         const addedObjects = new Set(document.worldPatch.flatMap((op) => op.type === 'object.add' ? [op.object.id] : []));
@@ -85,17 +125,24 @@ export class CgService {
       const shotOrdinal = prompt.match(/第([一二三四五六七八九十\d]+)(?:个)?镜头/);
       const ordinal = shotOrdinal ? (/^\d+$/.test(shotOrdinal[1]) ? Number(shotOrdinal[1]) : '一二三四五六七八九十'.indexOf(shotOrdinal[1]) + 1) : null;
       const selected = ordinal ? project.document.shots[ordinal - 1] : project.document.shots.find((s) => s.id === targetId) ?? (project.document.shots.length === 1 ? project.document.shots[0] : undefined);
+      const selectedBehavior = project.document.actions.find(a => a.id === targetId);
       const simple = prompt.replace(/第[一二三四五六七八九十\d]+(?:个)?镜头/g, '').replace(/这个镜头|镜头|请|这里|改成|改为|变成|换成|一点|一些|，|。|\s/g, '');
-      if (selected && ['慢', '慢点', '再慢', '快', '快点', '特写', '近景', '中景', '远景', '全景'].includes(simple)) {
-        if (simple.includes('慢') || simple.includes('快')) operations = [{ type: 'shot.update', id: selected.id, patch: { duration: Math.min(300, selected.duration * (simple.includes('慢') ? 1.25 : 0.8)) } }];
+      if (selectedBehavior && ['慢', '慢点', '再慢', '快', '快点'].includes(simple)) {
+        operations = [{ type: 'action.update', id: selectedBehavior.id, patch: { duration: Math.min(300, selectedBehavior.duration * (simple.includes('慢') ? 1.25 : 0.8)) } }];
+      } else if (!selectedBehavior && selected && ['慢', '慢点', '再慢', '快', '快点', '特写', '近景', '中景', '远景', '全景'].includes(simple)) {
+        if (simple.includes('慢') || simple.includes('快')) {
+          const compiledShot = project.candidate?.documentRevision === project.document.revision ? project.candidate.shots.find(s => s.id === selected.id) : undefined;
+          const duration = compiledShot ? compiledShot.end - compiledShot.start : selected.duration;
+          operations = [{ type: 'shot.update', id: selected.id, patch: { duration: Math.min(300, duration * (simple.includes('慢') ? 1.25 : 0.8)) } }];
+        }
         else operations = [{ type: 'shot.update', id: selected.id, patch: { camera: ['特写', '近景'].includes(simple)
           ? { framing: 'close-up', movement: 'static', reference: 'subject-facing', view: 'front-three-quarter', aim: 'eyes', lensMm: 85 }
           : { framing: simple === '中景' ? 'medium' : 'wide' } } }];
       } else {
-        const result = parseJson(await this.chat([
-          { role: 'system', content: REFINE_SYSTEM_PROMPT },
-          { role: 'user', content: JSON.stringify({ intent: prompt, targetId, document: project.document, map: buildSemanticContext(project.mapSnapshot) }) }
-        ]));
+        const result = await this.directorAnswer([
+          { role: 'system', content: `${REFINE_SYSTEM_PROMPT}${project.document.schemaVersion === 2 ? '\nV2: the target may be a behavior. action.update additionally supports route, interaction, endBehavior and purpose using existing guide/object/node/anchor IDs. Do not add coordinates. Behavior timing references actions only. shot.update may additionally select a matching skillId/coveragePurpose; camera supports layout solo/two-shot/over-shoulder, aimMode fixed/follow and pitch in radians. Camera edits never edit behaviors. Seated contact persists and unsupported stand/IK/speech must be reported, not invented.' : ''}` },
+          { role: 'user', content: JSON.stringify({ intent: prompt, targetId, document: project.document, map: buildSemanticContext(project.mapSnapshot), shotSkills: project.document.schemaVersion === 2 ? CG_SHOT_SKILLS : undefined, performance: project.candidate?.documentRevision === project.document.revision && project.candidate.performance ? performanceForDirector(project.candidate) : undefined, currentView: targetId && project.candidate?.documentRevision === project.document.revision ? compactViewSamples(inspectShotSamples(project.candidate, targetId)) : [] }) }
+        ], project.mapSnapshot);
         assertSupportedAnswer(result, 'unsupported_refine');
         if (!Array.isArray(result)) fail('invalid_patch', 'AI 必须返回局部修改数组。');
         operations = result as CgPatchOperation[];
@@ -114,6 +161,21 @@ export class CgService {
     return this.run(id, 'resources', '冻结模型和动画资源', () => this.store.transaction(id, revision, async (project) => {
       this.assertDocument(project.document);
       await this.resolveResources(project);
+      if (project.document.schemaVersion === 2 && project.coveragePending) {
+        this.progress.set(id, { stage: 'performance', message: '先验证路线、交互和持续姿态', running: true });
+        const performance = compileDirector(project.document, project.mapSnapshot, project.schemeSnapshot, project.resources, undefined, { performanceOnly: true });
+        if (!performance.validation.valid) { project.candidate = performance; return; }
+        this.progress.set(id, { stage: 'coverage', message: '导演依据已验证的行为与姿态选择镜头', running: true });
+        const answer = await this.directorAnswer([
+          { role: 'system', content: `${CG_COVERAGE_PROMPT}\n${CG_WORLD_READING_PROMPT}` },
+          { role: 'user', content: JSON.stringify({ document: project.document, performance: performanceForDirector(performance), shotSkills: CG_SHOT_SKILLS, map: buildSemanticContext(project.mapSnapshot) }) }
+        ], project.mapSnapshot);
+        assertSupportedAnswer(answer, 'unsupported_intent');
+        if (!Array.isArray(answer) || answer.length > 128) fail('invalid_coverage', '镜头阶段需要有范围限制的镜头修改数组。');
+        for (const op of answer) if (!op || op.type !== 'shot.update' || !project.document.shots.some(s => s.id === op.id) || !op.patch || Object.keys(op.patch).some(k => !['skillId', 'coveragePurpose', 'name', 'purpose', 'camera', 'transition', 'subtitle'].includes(k))) fail('invalid_coverage', '镜头阶段不能修改行为、时间或人工约束。');
+        if (answer.length) project.document = this.applyPatch(project.document, answer, 'ai');
+        project.coveragePending = false;
+      }
       this.progress.set(id, { stage: 'compiling', message: '编译镜头、行动和世界状态并校验硬约束', running: true });
       project.candidate = compileDirector(project.document, project.mapSnapshot, project.schemeSnapshot, project.resources, project.candidate ?? project.confirmed ?? undefined);
     }));
@@ -122,6 +184,7 @@ export class CgService {
   async confirm(id: string, revision: number, compileId: string, inputHash: string) {
     return this.store.transaction(id, revision, (project) => {
       const candidate = project.candidate;
+      if (candidate?.stage === 'performance') fail('incomplete_compile', '行为验证结果尚未完成镜头编译，不能确认。');
       if (!candidate || candidate.id !== compileId || candidate.inputHash !== inputHash || candidate.documentRevision !== project.document.revision) fail('stale_compile', '预览已过期，请重新编译并预览当前版本。');
       if (!candidate.validation.valid) fail('invalid_compile', '编译存在错误，不能确认。');
       const current = compileDirector(project.document, project.mapSnapshot, project.schemeSnapshot, project.resources);
@@ -153,13 +216,14 @@ export class CgService {
         models.set(assetId, asset);
       }
       const model = models.get(assetId)!;
-      for (const action of project.document.actions.filter((a) => a.entityId === entity.id && a.type === 'animate')) {
+      for (const action of project.document.actions.filter((a) => a.entityId === entity.id && (a.type === 'animate' || a.type === 'sit' || a.type === 'move' && a.route))) {
         const clipId = action.clipId!;
+        if (!clipId) fail('missing_clip_id', '移动和交互行为需要稳定的 clipId。');
         const modelHash = stableHash(model.modelJson);
         const existing = project.resources.clips.find((c) => c.id === clipId);
-        if (existing?.entityId === entity.id && existing.modelHash === modelHash) continue;
+        if (existing?.entityId === entity.id && existing.modelHash === modelHash && (action.type !== 'sit' || Math.abs(existing.duration - action.duration) < 1e-4)) continue;
         if (existing && existing.entityId !== entity.id) fail('shared_clip_id', '不同角色不能共享同一个 clipId；动画必须绑定到明确的角色和模型。');
-        const description = `In-place local animation ${clipId}. Character: ${entity.name}. Scene intent: ${project.document.sourcePrompt}. Animate only existing node IDs. The cutscene owns world translation: root nodes must have zero X/Z translation. No particles or camera motion.`;
+        const description = `In-place local animation ${clipId}. Behavior: ${action.type}; ${action.purpose ?? ''}; locomotion: ${action.route?.locomotion ?? 'none'}. Character: ${entity.name}. Scene intent: ${project.document.sourcePrompt}. ${action.type === 'sit' ? 'Produce a non-looping sit-down transition that ends in a seated pose, never blends back to standing. The contact solver owns root positioning. The actor must expose a cgRig contact profile; do not invent absent joints.' : ''} Animate only existing node IDs. The cutscene owns world translation: root nodes must have zero X/Z translation. No particles or camera motion.`;
         const key = `clip_${stableHash({ modelHash, description, duration: action.duration })}`;
         let clip = await this.store.cached<CgClip>(key);
         if (!clip) {
@@ -174,18 +238,59 @@ export class CgService {
     }
   }
 
+  private async directorAnswer(initial: ChatMessage[], map: EditableMap): Promise<unknown> {
+    const messages = [...initial], index = buildWorldSemanticIndex(map);
+    for (let round = 0; round <= 3; round++) {
+      const raw = await this.chat(messages), answer = parseJson(raw);
+      if (!answer || typeof answer !== 'object' || Array.isArray(answer) || !('worldQueries' in answer)) return answer;
+      const queries = (answer as { worldQueries: unknown }).worldQueries;
+      if (round === 3 || !Array.isArray(queries) || !queries.length || queries.length > 6 || Object.keys(answer).some(k => k !== 'worldQueries')) fail('world_query_limit', '导演地图查询超过限制，请缩小问题范围后重试。');
+      const results = queries.map(query => {
+        try { return queryWorld(map, query, index); }
+        catch (error) { return { sourceHash: index.sourceHash, error: 'invalid_world_query', message: error instanceof Error ? error.message : String(error) }; }
+      });
+      messages.push({ role: 'assistant', content: raw }, { role: 'user', content: JSON.stringify({ worldQueryResults: results, remainingQueryRounds: 2 - round, instruction: 'Use these measured facts, then return the requested final document or patch.' }) });
+    }
+    return fail('world_query_limit', '导演未能在限定查询次数内形成方案。');
+  }
+
   private chat(messages: ChatMessage[]) { return this.options.chat ? this.options.chat(messages) : llmChat(messages, { apiBase: process.env.CG_MODEL_API_BASE, maxTokens: 12000, signal: AbortSignal.timeout(180_000) }); }
   private applyPatch(document: DirectorDocument, operations: CgPatchOperation[], source: 'user' | 'ai') {
     try { return applyDirectorPatch(document, operations, source); }
     catch (error) { return fail('invalid_patch', error instanceof Error ? error.message : String(error)); }
   }
   private requirePrompt(prompt: string) { if (typeof prompt !== 'string' || !prompt.trim() || prompt.length > 16000) fail('invalid_prompt', '请输入 1–16000 字的导演意图。'); }
+  private assertMap(map: EditableMap) { if (!map || !/^[a-zA-Z0-9][a-zA-Z0-9:_-]{0,119}$/.test(map.id) || !Array.isArray(map.objects) || !map.box || !map.terrain || !Array.isArray(map.terrain.heights)) fail('invalid_map', '请提供完整的 WorldForge 地图快照。'); }
   private assertDocument(document: unknown) { const result = validateDirectorDocument(document); if (!result.valid) fail('invalid_director_document', result.diagnostics.map((d) => d.message).join('\n')); }
   private async run<T>(id: string, stage: string, message: string, work: () => Promise<T>) {
     this.progress.set(id, { stage, message, running: true });
     try { const result = await work(); this.progress.set(id, { stage: 'ready', message: '完成', running: false }); return result; }
     catch (error) { this.progress.set(id, { stage: 'error', message: error instanceof Error ? error.message : String(error), running: false }); throw error; }
   }
+}
+
+export function summarizeMapSync(before: EditableMap, after: EditableMap, beforeScheme: RenderScheme | null, afterScheme: RenderScheme | null): CgMapSyncSummary {
+  const oldObjects = new Map(before.objects.map((object) => [object.id, object]));
+  const newObjects = new Map(after.objects.map((object) => [object.id, object]));
+  const oldAssets = new Map((before.assets ?? []).map((asset) => [asset.id, asset]));
+  const newAssets = new Map((after.assets ?? []).map((asset) => [asset.id, asset]));
+  const ids = (values: Iterable<string>) => [...values].sort();
+  const addedObjectIds = ids([...newObjects.keys()].filter((id) => !oldObjects.has(id)));
+  const removedObjectIds = ids([...oldObjects.keys()].filter((id) => !newObjects.has(id)));
+  const changedObjectIds = ids([...newObjects.keys()].filter((id) => oldObjects.has(id) && stableHash(oldObjects.get(id)) !== stableHash(newObjects.get(id))));
+  const changedAssetIds = ids(new Set([
+    ...[...newAssets.keys()].filter((id) => !oldAssets.has(id) || stableHash(oldAssets.get(id)) !== stableHash(newAssets.get(id))),
+    ...[...oldAssets.keys()].filter((id) => !newAssets.has(id))
+  ]));
+  const worldView = (map: EditableMap) => ({ ...map, objects: [], assets: [], version: 0, updatedAt: 0 });
+  return {
+    addedObjectIds,
+    removedObjectIds,
+    changedObjectIds,
+    changedAssetIds,
+    worldChanged: stableHash(worldView(before)) !== stableHash(worldView(after)),
+    schemeChanged: stableHash(beforeScheme) !== stableHash(afterScheme)
+  };
 }
 
 function parseJson(text: string): unknown {
@@ -204,22 +309,40 @@ export function buildSemanticContext(map: EditableMap) {
   const transforms = getObjectWorldTransforms(map);
   const anchors: DirectorDocument['anchors'] = [
     ...map.spawnPoints.map((p, index) => ({ id: `map_spawn_${index}`, name: `出生点 ${index + 1}`, kind: 'point' as const, position: [p[0], sampleTerrainHeight(map, p[0], p[2]), p[2]] as CgVec3, space: 'world' as const })),
-    ...map.objects.map((o, index) => ({ id: `map_object_${index}`, name: o.name, kind: 'point' as const, position: clone(transforms.get(o.id)?.position ?? o.transform.position), space: 'world' as const }))
+    ...map.objects.map((o) => ({ id: `map_object:${o.id}`, name: o.name, kind: 'point' as const, position: clone(transforms.get(o.id)?.position ?? o.transform.position), space: 'world' as const, objectId: o.id }))
   ];
+  anchors.push(...mapSpatialAnchors(map));
   const [from, to] = demoPath(map);
   anchors.push({ id: 'map_stage_start', name: '可用演出起点', kind: 'point', position: from, space: 'world' }, { id: 'map_stage_end', name: '可用演出终点', kind: 'point', position: to, space: 'world' });
-  return { id: map.id, name: map.name, axis: 'Y-up', units: 'metres', bounds: getMapBounds(map), sceneMode: map.sceneMode, layout: map.layout, designSemantics: map.designSemantics, objects: map.objects.map((o) => ({ id: o.id, name: o.name, assetId: o.assetId, visible: o.visible, locked: o.locked, worldTransform: transforms.get(o.id), tags: map.assets?.find((a) => a.id === o.assetId)?.tags ?? [] })), assets: (map.assets ?? []).map((a) => ({ id: a.id, name: a.name, description: a.prompt, nodes: (a.modelJson as { nodes?: Array<{ id: string }> })?.nodes?.map((n) => n.id) ?? [] })), anchors };
+  const fullIndex = buildWorldSemanticIndex(map);
+  const spatialEntities = fullIndex.entities.filter((entity) => entity.kind !== 'model-part').map((entity) => ({ ...entity, description: entity.description?.slice(0, 600) }));
+  const assetHierarchies = (map.assets ?? []).map((asset) => {
+    const model = asset.modelJson as { nodes?: Array<{ id?: unknown; name?: unknown; label?: unknown; parent?: unknown; tags?: unknown; transform?: { pos?: unknown } }>; _meta?: { semanticSnapshot?: { text?: unknown } } };
+    return {
+      assetId: asset.id, name: asset.name, description: asset.prompt.slice(0, 600), tags: asset.tags ?? [],
+      nodes: (model.nodes ?? []).flatMap((node) => typeof node.id === 'string' ? [{ id: node.id, name: typeof node.name === 'string' ? node.name : typeof node.label === 'string' ? node.label : node.id, ...(typeof node.parent === 'string' ? { parent: node.parent } : {}), ...(Array.isArray(node.tags) ? { tags: node.tags } : {}), ...(Array.isArray(node.transform?.pos) ? { position: node.transform.pos } : {}) }] : []),
+      semanticSummary: typeof model._meta?.semanticSnapshot?.text === 'string' ? model._meta.semanticSnapshot.text.slice(0, 4000) : undefined,
+      contactProfile: (asset.modelJson as { _meta?: { cgRig?: unknown } })?._meta?.cgRig ?? null
+    };
+  });
+  return { id: map.id, name: map.name, axis: 'Y-up', units: 'metres', bounds: getMapBounds(map), sceneMode: map.sceneMode, layout: map.layout, worldUnderstanding: worldSummary(fullIndex), designSemantics: fullIndex.designSemantics, semanticIndex: { schemaVersion: 1, mapId: map.id, mapVersion: map.version, sourceHash: fullIndex.sourceHash, spatialEntities, assetHierarchies }, objects: map.objects.map((o) => ({ id: o.id, name: o.name, assetId: o.assetId, visible: o.visible, locked: o.locked, worldTransform: transforms.get(o.id), tags: map.assets?.find((a) => a.id === o.assetId)?.tags ?? [] })), anchors };
 }
 
-export const DIRECTOR_SYSTEM_PROMPT = `You direct an editable real-time 3D cutscene in WorldForge. Return ONLY a DirectorDocument JSON object. No code, video, prose, keyframes, executable expressions or invented map object IDs. Coordinates are Y-up metres; camera looks along its local -Z. Work from the supplied semantic map and exact existing IDs. Use supplied named anchors verbatim; never invent coordinates. New entities may reference a new stable assetId plus a precise description for 3d-generate; never pretend the model already exists. Prefer existing assets. New actors require startAnchorId. Existing map objects use objectId.
-Use the supplied documentIdentity unchanged, schemaVersion:1, title, sourcePrompt, entities, anchors, shots, actions, constraints, worldPatch. Every ID must be unique across nodes, ASCII letters/digits/_/-/:. Preserve every existing manual hard constraint and its anchor verbatim. A constraint cannot be dropped when replanning.
-Entity: {id,name,kind:'actor'|'prop',objectId?,assetId?,startAnchorId?,description?,height?}. Anchor: exact supplied object. Shots are sequential {id,name,purpose,duration,camera,transition?,subtitle?}. Camera is semantic {movement:'static'|'dolly'|'tracking'|'orbit',framing:'wide'|'medium'|'close-up'|'over-shoulder',subjectId,secondaryId?,side?:'left'|'right',lensMm?,distance?,height?,azimuth?,reference?:'world'|'subject-facing'|'subject-motion'|'interaction-axis',view?:'front'|'front-three-quarter'|'side'|'rear-three-quarter'|'rear',aim?:'body'|'upper-body'|'face'|'eyes'|'interaction',screenPosition?:[x,y]}. Every moving-subject shot must state reference, view and aim. Travel/context defaults to a side or rear-three-quarter view in subject-motion space; arrival defaults to rear or rear-three-quarter. Use a moving front view only when the purpose explicitly needs the face during motion. A close-up must aim at face/eyes in subject-facing space, use a 70–100mm lens, and normally omit distance/height so semantic landmarks determine both. Over-shoulder requires two distinct subjects and interaction-axis. Transition is {type:'cut'|'ease-in-out',duration?,motivation:'action'|'look'|'reaction'|'reveal'|'reestablish'|'rhythm'}; omit it on the first shot and use a motivated value afterward. Preserve screen direction and the 30-degree rule. Favor stable composition and restrained movement; camera movement cannot own actor motion.
-Actions are continuous across cuts: {id,entityId,type:'move'|'face'|'animate'|'visibility'|'effect',start:{kind:'absolute',seconds}|{kind:'after'|'with',id,offset?},duration,targetAnchorId?,targetEntityId?,clipId?,visible?,effect?:'spark'}. A move requires targetAnchorId. An animate action needs a meaningful stable clipId unique per entity; missing clips are generated as local in-place motion. A face needs target entity or anchor. Effects support only deterministic spark. Do not invent attachment, physics, IK, dialogue audio or lip sync. Duration must fit the shot timeline; use after/with to preserve timing dependencies. Do not overlap two moves or two animate actions for one entity. Manual time and camera locks always win.
-worldPatch is a declarative WorldForge transaction array applied only to a CG snapshot. Supported operations: object.update {objectId,patch:{visible?,transform?}}, object.remove {objectId}, object.add {object:{id,name,assetId,parentId:null,visible:true,locked:false,transform:{position,rotation,scale,size}}}, sun.set {point}. Use existing transforms or supplied anchor positions, not arbitrary coordinates. Other world operations require an explicit supported schema and must not be guessed. Source map locked objects must be preserved. Default worldPatch:[]. constraints defaults to [] only for a new document. Keep the first version short (10–30 seconds, 2–4 shots), grounded in the user intent. An unsupported request must return {error:'unsupported_intent',reason:'...'} instead of silently approximating it.
-${CG_CAMERA_GRAMMAR_PROMPT}`;
+function compactViewSamples(samples: ReturnType<typeof inspectShotSamples>) {
+  return samples.map((sample) => ({ ...sample, items: sample.items.map(({ semanticParts: _parts, ...item }) => item) }));
+}
 
-const REFINE_SYSTEM_PROMPT = `Return only a JSON array of narrowly scoped CgPatchOperation objects, never a replacement document. Existing IDs are immutable. Allowed operations: {type:'shot.update',id,patch:{name?,purpose?,duration?,transition?:{type,motivation,duration?},subtitle?,camera?:{movement?,framing?,subjectId?,secondaryId?,side?,lensMm?,distance?,height?,azimuth?,reference?,view?,aim?,screenPosition?}}}, {type:'action.update',id,patch:{start?,duration?,targetAnchorId?,targetEntityId?,clipId?,visible?}}, {type:'entity.update',id,patch:{name?,description?,startAnchorId?}}. Use exact IDs and existing anchors. If targetId is supplied, modify only that ID. Never modify user constraints, anchors used by locks, or locked values. Preserve unrelated actions and camera intent. Axis is Y-up metres and azimuth is radians. Supported camera movement static/dolly/tracking/orbit; framing wide/medium/close-up/over-shoulder. When changing to close-up also set movement static, reference subject-facing, view front-three-quarter, aim eyes and lensMm 70–100; omit distance and height unless explicitly requested. Travel follows use subject-motion with side/rear-three-quarter rather than front unless the intent explicitly asks to read the face during motion. Slow a selected shot by changing only its duration unless the user explicitly requests an action timing change. Unsupported requests return {error:'unsupported_refine',reason:'...'} and no fake success.
-${CG_CAMERA_GRAMMAR_PROMPT}`;
+export const DIRECTOR_SYSTEM_PROMPT = `You direct an editable real-time 3D cutscene in WorldForge. Return ONLY a DirectorDocument JSON object. No code, video, prose, keyframes, executable expressions or invented map object IDs. Coordinates are Y-up metres; camera looks along its local -Z. Work from the supplied semantic map and exact existing IDs. semanticIndex.spatialEntities identifies placed objects and WorldForge group/focus/viewpoint/zone/guide/water/grass geography. semanticIndex.assetHierarchies preserves each reusable 3d-generate asset's model-part names and parents once; join it to placed instances by assetId. Ground location language such as pavilion, pond, forest, entrance or seat in those stable semantic IDs before choosing supplied anchors. Use supplied named anchors verbatim; never invent coordinates. New entities may reference a new stable assetId plus a precise description for 3d-generate; never pretend the model already exists. Prefer existing assets. New actors require startAnchorId. Existing map objects use objectId.
+Use the supplied documentIdentity unchanged, schemaVersion:2, title, sourcePrompt, entities, anchors, shots, actions, constraints, worldPatch. This is the PERFORMANCE planning stage: first ground actors, props, behavior goals, route choices, timing and interactions. For a NEW document return shots:[]; the service derives stable coverage slots and chooses cameras AFTER verifying the actual performance. Retain existing shots when replanning a document with camera locks. Every ID must be unique across nodes, ASCII letters/digits/_/-/:. Preserve every existing manual hard constraint and its anchor verbatim. A constraint cannot be dropped when replanning.
+Entity: {id,name,kind:'actor'|'prop',objectId?,assetId?,startAnchorId?,description?,height?}. Anchor: exact supplied object. Shots are sequential {id,name,purpose,duration,camera,transition?,subtitle?}. Camera is semantic {movement:'static'|'dolly'|'tracking'|'orbit',framing:'wide'|'medium'|'close-up'|'over-shoulder',subjectId,secondaryId?,side?:'left'|'right',lensMm?,distance?,height?,azimuth?,reference?:'world'|'subject-facing'|'subject-motion'|'interaction-axis',view?:'front'|'front-three-quarter'|'side'|'rear-three-quarter'|'rear',aim?:'body'|'upper-body'|'face'|'eyes'|'interaction',screenPosition?:[x,y]}. Every moving-subject shot must state reference, view and aim. Travel/context defaults to a side or rear-three-quarter view in subject-motion space; arrival defaults to rear or rear-three-quarter. Use a moving front view only when the purpose explicitly needs the face during motion. A close-up must aim at face/eyes in subject-facing space, use a 70–100mm lens, and normally omit distance/height so semantic landmarks determine both. Over-shoulder requires two distinct subjects and interaction-axis. Transition is {type:'cut'|'ease-in-out',duration?,motivation:'action'|'look'|'reaction'|'reveal'|'reestablish'|'rhythm'}; omit it on the first shot and use a motivated value afterward. Preserve screen direction and the 30-degree rule. Favor stable composition and restrained movement; camera movement cannot own actor motion.
+Actions own the performance timeline: {id,entityId,type:'move'|'face'|'animate'|'visibility'|'effect'|'sit'|'dialogue'|'hold',start:{kind:'absolute',seconds}|{kind:'after'|'with',id,offset?},duration,targetAnchorId?,targetEntityId?,clipId?,visible?,effect?:'spark',purpose?,route?,interaction?,endBehavior?}. V2 timing references other actions, NEVER shots. A move requires targetAnchorId; when using a road add route:{guideIds:[exact existing guide IDs],policy:'required'|'preferred',locomotion:'walk'|'run',maxSpeed?} and clipId for its own in-place gait. Do not overlay a second gait animate action. Use provided map_guide and map_seat anchors verbatim, including bindings. A sit requires clipId and interaction:{objectId,seatNodeId,approachAnchorId}; first move to that exact approach anchor and orient the actor. Sit is supported only for a stationary named box seat and an actor with explicit contactProfile hips/leftFoot/rightFoot landmarks; the solver must validate the actual clip and feet support. Never pretend an unprofiled model is contact-ready. Sit persists; hold keeps the seated state. Do not move or replace a seated actor's whole-body animation without a supported stand transition (currently unavailable). Dialogue requires targetEntityId for a distinct participant and means staged facing/turns only, not speech or lip sync. Animate supports endBehavior:'restore'|'hold'. A face needs a target entity or anchor. Effects support only spark. Do not invent attachment, physics, IK or unsupported motion. Do not overlap competing root actions or full-body animations. Preserve manual time and camera locks.
+worldPatch is a declarative WorldForge transaction array applied only to a CG snapshot. Supported operations: object.update {objectId,patch:{visible?,transform?}}, object.remove {objectId}, object.add {object:{id,name,assetId,parentId:null,visible:true,locked:false,transform:{position,rotation,scale,size}}}, sun.set {point}. Use existing transforms or supplied anchor positions, not arbitrary coordinates. Other world operations require an explicit supported schema and must not be guessed. Source map locked objects must be preserved. Default worldPatch:[]. constraints defaults to [] only for a new document. Keep the first version short (10–30 seconds, 2–4 shots), grounded in the user intent. An unsupported request must return {error:'unsupported_intent',reason:'...'} instead of silently approximating it.
+${CG_CAMERA_GRAMMAR_PROMPT}
+${CG_WORLD_READING_PROMPT}`;
+
+const REFINE_SYSTEM_PROMPT = `Return only a JSON array of narrowly scoped CgPatchOperation objects, never a replacement document. Existing IDs are immutable. Allowed operations: {type:'shot.update',id,patch:{name?,purpose?,duration?,transition?:{type,motivation,duration?},subtitle?,camera?:{movement?,framing?,subjectId?,secondaryId?,side?,lensMm?,distance?,height?,azimuth?,reference?,view?,aim?,screenPosition?}}}, {type:'action.update',id,patch:{start?,duration?,targetAnchorId?,targetEntityId?,clipId?,visible?}}, {type:'entity.update',id,patch:{name?,description?,startAnchorId?}}. Use exact IDs and existing anchors. If targetId is supplied, modify only that ID. Never modify user constraints, anchors used by locks, or locked values. Preserve unrelated actions and camera intent. currentView contains mechanically measured beginning/middle/end observations for the selected compiled shot: screen region, coverage, visible fraction and occluder IDs. Use these facts to diagnose framing, but do not claim they prove artistic quality. Axis is Y-up metres and azimuth is radians. Supported camera movement static/dolly/tracking/orbit; framing wide/medium/close-up/over-shoulder. When changing to close-up also set movement static, reference subject-facing, view front-three-quarter, aim eyes and lensMm 70–100; omit distance and height unless explicitly requested. Travel follows use subject-motion with side/rear-three-quarter rather than front unless the intent explicitly asks to read the face during motion. Slow a selected shot by changing only its duration unless the user explicitly requests an action timing change. Unsupported requests return {error:'unsupported_refine',reason:'...'} and no fake success.
+${CG_CAMERA_GRAMMAR_PROMPT}
+${CG_WORLD_READING_PROMPT}`;
 
 async function requestBakedAnimation(modelJson: unknown, description: string, duration: number) {
   const response = await fetch(`${process.env.CG_MODEL_API_BASE ?? MODEL_API_BASE}/api/generate/animation`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ mode: 'quick', modelJson, description, duration, provider: 'gpt', emitParticles: false }), signal: AbortSignal.timeout(300_000) });

@@ -9,7 +9,6 @@
       "default": "./dist-map-core/index.js"
     },
     "./viewer": "./src/client/mapViewer.ts",
-    "./host": "./src/client/mapHost.ts",
     "./vite": "./voxelStudioVite.mjs"
   },
   "scripts": {
@@ -21,6 +20,7 @@
     "seed:goldens": "tsx scripts/buildStarterSeed.ts",
     "backup:data": "tsx scripts/backupMapData.ts",
     "test": "vitest run",
+    "verify:worldforge": "tsx scripts/verifyWorldforgeBase.ts",
     "server": "tsx src/server/index.ts -- --release",
     "map": "tsx src/server/mapCli.ts"
   },
