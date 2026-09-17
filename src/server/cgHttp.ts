@@ -61,6 +61,22 @@ export async function handleCgHttp(req: http.IncomingMessage, res: http.ServerRe
       send(200, { projectRevision: project.revision, ...worldSummary(buildWorldSemanticIndex(project.mapSnapshot)) });
       return true;
     }
+    if (parts.length === 5 && parts[4] === 'runs' && req.method === 'GET') {
+      send(200, { runs: await service.orchestrator.runs.list(id) });
+      return true;
+    }
+    if (parts.length === 6 && parts[4] === 'runs' && req.method === 'GET') {
+      const run = await service.orchestrator.runs.read(parts[5]);
+      if (run.projectId !== id) throw new CgHttpError(404, 'run_not_found', '生成 Run 不属于这个项目。');
+      send(200, run);
+      return true;
+    }
+    if (parts.length === 8 && parts[4] === 'runs' && parts[6] === 'artifacts' && req.method === 'GET') {
+      const run = await service.orchestrator.runs.read(parts[5]);
+      if (run.projectId !== id || !run.artifacts.some(item => item.id === parts[7])) throw new CgHttpError(404, 'artifact_not_found', 'Artifact 不属于这个生成 Run。');
+      send(200, await service.orchestrator.artifacts.read(parts[7]));
+      return true;
+    }
     if (parts.length === 5 && req.method === 'GET' && parts[4] === 'progress') {
       await service.store.read(id);
       send(200, service.progress.get(id) ?? { stage: 'idle', message: '等待操作', running: false });
@@ -78,11 +94,18 @@ export async function handleCgHttp(req: http.IncomingMessage, res: http.ServerRe
       send(200, project.confirmed);
       return true;
     }
+    if (parts.length === 7 && parts[4] === 'runs' && req.method === 'POST' && ['resume', 'cancel'].includes(parts[6])) {
+      const run = await service.orchestrator.runs.read(parts[5]);
+      if (run.projectId !== id) throw new CgHttpError(404, 'run_not_found', '生成 Run 不属于这个项目。');
+      send(200, parts[6] === 'resume' ? await service.orchestrator.resume(run.id) : await service.orchestrator.cancel(run.id));
+      return true;
+    }
     if (parts.length !== 5 || req.method !== 'POST') { send(404, { error: 'route_not_found' }); return true; }
     const body = await readJson(req);
     const revision = body.revision as number;
     if (!Number.isSafeInteger(revision) || revision < 0) throw new CgHttpError(400, 'revision_required', '需要当前项目 revision。');
     switch (parts[4]) {
+      case 'runs': send(200, await service.generate(id, revision, body.prompt as string, body.demo === true)); break;
       case 'world-query': {
         const project = await service.store.read(id);
         const index = buildWorldSemanticIndex(project.mapSnapshot);

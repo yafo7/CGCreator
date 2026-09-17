@@ -66,10 +66,27 @@ export function buildPoseRig(modelJson: unknown): CgPoseRig {
   if (!bounds.isEmpty()) rig.normalization = [-(bounds.min.x + bounds.max.x) / 2, -bounds.min.y, -(bounds.min.z + bounds.max.z) / 2];
   const head = nodes.find(n => /(^|[_\s-])(head|face|头|脸)([_\s-]|$)/i.test(`${n.id} ${n.name}`));
   if (head) {
-    const box = head.bounds, y = box ? box.min[1] + (box.max[1] - box.min[1]) * 0.66 : 0;
-    rig.landmarks.head = { nodeId: head.id, point: [0, 0, 0] };
-    rig.landmarks.eyes = { nodeId: head.id, point: [0, y, box ? box.max[2] : 0] };
-    rig.landmarks.face = { nodeId: head.id, point: [0, box ? (box.min[1] + box.max[1]) / 2 : 0, box ? box.max[2] : 0] };
+    // Generated models commonly use a meshless `head` animation group whose
+    // face, hair and eye meshes are descendants. Measure the whole subtree in
+    // head-local space instead of falling back to the group pivot (usually the
+    // neck), otherwise close-ups aim through the body and self-occlude.
+    const parents = new Map(nodes.map(node => [node.id, node.parent]));
+    const belongsToHead = (node: CgPoseNode) => {
+      let id: string | undefined = node.id;
+      while (id) { if (id === head.id) return true; id = parents.get(id); }
+      return false;
+    };
+    const headInverse = matrices.get(head.id)!.clone().invert(), headBounds = new Box3();
+    for (const node of nodes) if (node.bounds && belongsToHead(node)) {
+      const relative = headInverse.clone().multiply(matrices.get(node.id)!);
+      headBounds.union(new Box3(new Vector3(...node.bounds.min), new Vector3(...node.bounds.max)).applyMatrix4(relative));
+    }
+    const box = !headBounds.isEmpty() ? { min: headBounds.min.toArray() as CgVec3, max: headBounds.max.toArray() as CgVec3 } : head.bounds;
+    const center = box ? [(box.min[0] + box.max[0]) / 2, (box.min[1] + box.max[1]) / 2, (box.min[2] + box.max[2]) / 2] as CgVec3 : [0, 0, 0] as CgVec3;
+    const y = box ? box.min[1] + (box.max[1] - box.min[1]) * 0.66 : 0;
+    rig.landmarks.head = { nodeId: head.id, point: center };
+    rig.landmarks.eyes = { nodeId: head.id, point: [center[0], y, box ? box.max[2] : 0] };
+    rig.landmarks.face = { nodeId: head.id, point: [center[0], center[1], box ? box.max[2] : 0] };
   }
   for (const [name, pattern] of [['hips', /hip|pelvis|骨盆/i], ['leftFoot', /left.?foot|foot.?l\b|左脚/i], ['rightFoot', /right.?foot|foot.?r\b|右脚/i]] as const) {
     const node = nodes.find(n => pattern.test(`${n.id} ${n.name}`));

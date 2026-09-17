@@ -67,7 +67,29 @@ export class CgStore {
   private async atomicWrite(filename: string, value: unknown) {
     await mkdir(path.dirname(filename), { recursive: true });
     const temp = `${filename}.${randomUUID()}.tmp`;
-    try { await writeFile(temp, JSON.stringify(value), 'utf8'); await rename(temp, filename); }
-    finally { await rm(temp, { force: true }); }
+    let committed = false;
+    try {
+      await writeFile(temp, JSON.stringify(value), { encoding: 'utf8', flag: 'wx' });
+      await renameWithRetry(temp, filename);
+      committed = true;
+    } finally {
+      // Keep a complete recovery file when Windows refuses the replace after
+      // all retries. Deleting it here would turn a transient sharing violation
+      // into permanent loss of an otherwise completed generation.
+      if (committed) await rm(temp, { force: true });
+    }
+  }
+}
+
+async function renameWithRetry(source: string, destination: string) {
+  const retryable = new Set(['EPERM', 'EBUSY', 'EACCES']);
+  const delays = [20, 50, 100, 200, 400, 800];
+  for (let attempt = 0; ; attempt++) {
+    try { await rename(source, destination); return; }
+    catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (!code || !retryable.has(code) || attempt >= delays.length) throw error;
+      await new Promise(resolve => setTimeout(resolve, delays[attempt]));
+    }
   }
 }

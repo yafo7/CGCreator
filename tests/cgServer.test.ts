@@ -8,12 +8,13 @@ import { buildModelColliderPlan } from '../src/shared/modelBounds';
 import { evaluateCG, stableHash } from '../src/shared/cgCompiler';
 import type { CgClip, CgProject, DirectorDocument } from '../src/shared/cgTypes';
 import { BUILTIN_RENDER_SCHEMES } from '../src/shared/renderScheme';
-import { CgService, buildSemanticContext, decodeBakedClip, summarizeMapSync } from '../src/server/cgService';
+import { CgService, buildSemanticContext, decodeBakedClip, requestBakedAnimation, summarizeMapSync } from '../src/server/cgService';
 import { CgStore } from '../src/server/cgStore';
 import { cgServiceFor, handleCgHttp } from '../src/server/cgHttp';
 import { MapStore } from '../src/server/mapStore';
 import { handleMapHttp } from '../src/server/mapHttp';
 import type { ChatMessage } from '../src/server/modelApi';
+import { modelHasEmbeddedProp, stripEmbeddedProp } from '../src/server/cgProductionAgent';
 
 let root: string;
 beforeEach(async () => { root = await mkdtemp(path.join(os.tmpdir(), 'cgcreator-server-')); });
@@ -141,6 +142,21 @@ describe('CG project storage and compile lifecycle', () => {
 });
 
 describe('CG planning, refine and resource resolution', () => {
+  it('removes only a duplicate embedded weapon subtree after Refine leaves it behind', () => {
+    const model = { nodes: [
+      { id: 'body', name: '年轻剑客躯干', mesh: { type: 'box' } },
+      { id: 'arm_right', name: '右臂', parent: 'body' },
+      { id: 'mount_sword', name: '手持长剑', parent: 'arm_right', mounted: true },
+      { id: 'sword_mesh', parent: 'mount_sword', mesh: { type: 'box' } },
+      { id: 'hairpin', name: '束发簪', parent: 'body', mesh: { type: 'box' } }
+    ], _meta: { mounts: [{ id: 'mount_sword', mountedGroupId: 'mount_sword' }] } };
+    expect(modelHasEmbeddedProp(model, '黑柄古风长剑')).toBe(true);
+    const cleaned = stripEmbeddedProp(model, '黑柄古风长剑') as typeof model;
+    expect(cleaned.nodes.map(node => node.id)).toEqual(['body', 'arm_right', 'hairpin']);
+    expect(cleaned._meta.mounts).toEqual([]);
+    expect(modelHasEmbeddedProp(cleaned, '黑柄古风长剑')).toBe(false);
+  });
+
   it('chooses coverage only after actual V2 performance validation and does not repeat AI on recompile', async () => {
     const chat = vi.fn(async (messages: ChatMessage[]) => {
       const input = JSON.parse(messages.at(-1)!.content as string);
@@ -163,6 +179,38 @@ describe('CG planning, refine and resource resolution', () => {
     expect(chat).toHaveBeenCalledTimes(2);
     await service.compile(project.id, project.revision);
     expect(chat).toHaveBeenCalledTimes(2);
+  }, 15000);
+
+  it('reuses the validated DirectorDocument when the same durable run is retried', async () => {
+    const chat = vi.fn(async (messages: ChatMessage[]) => {
+      const input = JSON.parse(messages.at(-1)!.content as string);
+      return JSON.stringify({ ...input.existingDocument, ...input.documentIdentity, shots: [] });
+    });
+    const service = new CgService(new CgStore(root), { chat });
+    let project = await service.foundationDemo();
+    project = await service.plan(project.id, project.revision, '同一段剧情');
+    const retried = await service.plan(project.id, project.revision, '同一段剧情');
+    expect(retried).toEqual(project);
+    expect(chat).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps camera planning least-authority when the model echoes forbidden timing or behavior edits', async () => {
+    const chat = vi.fn(async (messages: ChatMessage[]) => {
+      const input = JSON.parse(messages.at(-1)!.content as string);
+      if (input.performance) return JSON.stringify([
+        { type: 'shot.update', id: input.document.shots[0].id, patch: { duration: 99, camera: { side: 'left' } } },
+        { type: 'action.update', id: 'run', patch: { duration: 99 } }
+      ]);
+      return JSON.stringify({ ...input.existingDocument, ...input.documentIdentity, shots: [] });
+    });
+    const service = new CgService(new CgStore(root), { chat });
+    let project = await service.foundationDemo();
+    project = await service.plan(project.id, project.revision, '先完成行为，再选择镜头');
+    project = await service.compile(project.id, project.revision);
+    expect(project.document.shots[0].duration).not.toBe(99);
+    expect(project.document.actions.find(action => action.id === 'run')!.duration).toBe(6);
+    expect(project.document.shots[0].camera.side).toBe('left');
+    expect(project.candidate?.validation.valid).toBe(true);
   }, 15000);
 
   it('never asks for cameras when the performance is invalid and preserves confirmation', async () => {
@@ -285,15 +333,23 @@ describe('CG planning, refine and resource resolution', () => {
     await expect(service.plan(project.id, locked.revision, '重新演示', true)).rejects.toMatchObject({ code: 'hard_constraints_present' });
   });
 
-  it('protects exact manual anchors from AI and rejects invented locations during planning', async () => {
+  it('protects manual anchors, restores WorldForge anchor facts by ID and rejects invented locations', async () => {
     const chat = vi.fn(async () => JSON.stringify([{ type: 'anchor.upsert', anchor: { id: 'demo_end', name: 'AI position', kind: 'point', position: [0, 0, 0] } }]));
     const { service, project } = await demo(new CgService(new CgStore(root), { chat }));
     await expect(service.refine(project.id, project.revision, '把终点换个位置')).rejects.toMatchObject({ code: 'invalid_ai_patch' });
     expect(await service.store.read(project.id)).toEqual(project);
     const other = new CgService(new CgStore(path.join(root, 'other')), { chat: async (messages) => { const doc = planFromContext(messages); doc.anchors[0].position = [99, 0, 0]; return JSON.stringify(doc); } });
     const created = await other.create(mapFixture(), null);
-    await expect(other.plan(created.id, created.revision, 'A visitor walks')).rejects.toMatchObject({ code: 'invented_anchor' });
-    expect(await other.store.read(created.id)).toEqual(created);
+    const rebound = await other.plan(created.id, created.revision, 'A visitor walks');
+    expect(rebound.document.anchors.find(anchor => anchor.id === 'map_stage_start')?.position).toEqual([0, 0, 0]);
+    const invented = new CgService(new CgStore(path.join(root, 'invented')), { chat: async (messages) => {
+      const doc = planFromContext(messages.slice(0, 2));
+      doc.anchors[0] = { ...doc.anchors[0], id: 'invented_anchor' };
+      return JSON.stringify(doc);
+    } });
+    const inventedProject = await invented.create(mapFixture(), null);
+    await expect(invented.plan(inventedProject.id, inventedProject.revision, 'A visitor walks')).rejects.toMatchObject({ code: 'invalid_performance_plan' });
+    expect(await invented.store.read(inventedProject.id)).toEqual(inventedProject);
   });
 
   it('uses map semantics and resolves missing assets once, reusing them across camera edits and reopened projects', async () => {
@@ -346,9 +402,68 @@ describe('CG planning, refine and resource resolution', () => {
     await expect(service.refine(planned.id, planned.revision, 'Attach this to his hand')).rejects.toMatchObject({ status: 422, code: 'unsupported_refine', message: 'Socket attachment is not available.' });
     expect(await service.store.read(planned.id)).toEqual(planned);
   });
+
+  it('recovers a roof-to-bridge sword handoff into a playable automatic CG', async () => {
+    const map = mapFixture();
+    const boxModel = (id: string, width: number, height: number, depth: number) => ({ version: '1.0', nodes: [{ id, name: id, transform: { pos: [0, height / 2, 0] }, mesh: { type: 'box', params: { width, height, depth } } }] });
+    const roofAsset = { id: 'roof-model', name: '屋顶', prompt: '屋顶', modelJson: boxModel('roof', 4, 0.5, 4), colliderPlan: buildModelColliderPlan(boxModel('roof', 4, 0.5, 4)), mode: 'json' as const, createdAt: 1, updatedAt: 1 };
+    const bridgeAsset = { id: 'bridge-model', name: '桥', prompt: '桥', modelJson: boxModel('deck', 6, 0.35, 2), colliderPlan: buildModelColliderPlan(boxModel('deck', 6, 0.35, 2)), mode: 'json' as const, createdAt: 1, updatedAt: 1 };
+    map.assets = [roofAsset, bridgeAsset];
+    const roof = createMapObject('屋顶', roofAsset.id); roof.id = 'roof'; roof.transform.position = [-5, 2, 0];
+    const bridge = createMapObject('石桥', bridgeAsset.id); bridge.id = 'bridge'; bridge.transform.position = [3, 1, 0];
+    map.objects = [roof, bridge];
+    const mount = vi.fn(async (primary: unknown, _secondary: unknown, _description: string) => ({
+      modelJson: { ...(structuredClone(primary) as object), nodes: [...(structuredClone(primary) as typeof generatedModel).nodes, { id: 'mounted-sword', name: '佩剑挂载组', parent: 'hand', mounted: true, transform: { pos: [0, 0, 0.2], scale: [0.1, 0.1, 0.1] } }] },
+      mountedGroupId: 'mounted-sword'
+    }));
+    const animation = vi.fn(async () => baked());
+    const service = new CgService(new CgStore(root), {
+      chat: async () => JSON.stringify({ error: 'unsupported_intent', reason: 'legacy director cannot stage the handoff' }),
+      model: async () => structuredClone(generatedModel), mount, animation
+    });
+    const created = await service.create(map, null);
+    const planned = await service.plan(created.id, created.revision, '一位侠客从房顶上飞身落地，一直落到桥中心，在桥上已经有一位古风美女在等他。然后侠客从背后取下自己的剑交给美女。最后视角升起到全局，能发现有两个侍女在远处的树下看到了这一幕');
+    expect(planned.document.actions.map(action => action.type)).toEqual(expect.arrayContaining(['airborne', 'attach', 'handoff']));
+    expect(planned.document.actions.filter(action => action.type === 'animate')).toHaveLength(5);
+    expect(planned.document.shots).toHaveLength(3);
+    const compiled = await service.compile(planned.id, planned.revision);
+    expect(compiled.candidate?.validation).toEqual({ valid: true, diagnostics: [] });
+    expect(compiled.resources.assemblies).toHaveLength(3);
+    expect(compiled.resources.clips).toHaveLength(5);
+    expect(mount).toHaveBeenCalledTimes(3);
+    expect(animation).toHaveBeenCalledTimes(4);
+    const before = evaluateCG(compiled.candidate!, 4.2).entities.sword;
+    const after = evaluateCG(compiled.candidate!, 5.8).entities.sword;
+    expect(before.attachedTo).toBe('hero');
+    expect(after.attachedTo).toBe('heroine');
+    expect(evaluateCG(compiled.candidate!, 1.8).entities.hero.position[1]).toBeGreaterThan(Math.max(roof.transform.position[1], bridge.transform.position[1]));
+    const reveal = compiled.candidate!.shots.at(-1)!;
+    expect(evaluateCG(compiled.candidate!, reveal.end - 1e-3).camera.position[1]).toBeGreaterThan(evaluateCG(compiled.candidate!, reveal.start).camera.position[1]);
+  });
 });
 
 describe('3d-generate baked animation decoder', () => {
+  it('uses a visible semantic-node fallback when a quick animation request fails', async () => {
+    const originalFetch = globalThis.fetch;
+    const fetch = vi.fn(async () => new Response(JSON.stringify({ ok: false, error: 'GENERATION_FAILED' }), { status: 500, headers: { 'Content-Type': 'application/json' } }));
+    vi.stubGlobal('fetch', fetch);
+    try {
+      const rig = { version: '1.0', nodes: [
+        { id: 'body', name: 'body', transform: { pos: [0, 0, 0] } },
+        { id: 'head', name: 'head', parent: 'body', transform: { pos: [0, 1.5, 0] } },
+        { id: 'rightUpperArm', name: '执剑侧上臂', parent: 'body', transform: { pos: [0.4, 1, 0] } },
+        { id: 'body_mesh', parent: 'body', transform: { pos: [0, 0.9, 0] }, mesh: { type: 'box', params: { width: 0.5, height: 1.8, depth: 0.4 } } }
+      ] };
+      const result = await requestBakedAnimation(rig, '转头看向桥上的两个人', 2) as { _cgFallback?: boolean; duration?: number; animation?: Record<string, unknown> };
+      expect(result._cgFallback).toBe(true);
+      expect(result.duration).toBe(2);
+      expect(result.animation).toHaveProperty('head');
+      expect(fetch).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.stubGlobal('fetch', originalFetch);
+    }
+  });
+
   it('preserves Euler and position deltas with missing axes defaulted, and absolute quaternion tracks', () => {
     const value = baked();
     const clip = decodeBakedClip(value, identity, generatedModel);
@@ -373,6 +488,12 @@ describe('3d-generate baked animation decoder', () => {
     ['empty animation', {}, 'empty_animation']
   ])('rejects %s', (_label, animation, code) => {
     expect(() => decodeBakedClip({ ...baked(), animation }, identity, generatedModel)).toThrow(expect.objectContaining({ code }));
+  });
+
+  it('strips generated root X/Z drift only when compiling a locomotion cycle', () => {
+    const samples = [0, 0.05, 0.1, 0.15, 0.2, 0.25, 0.3];
+    const clip = decodeBakedClip({ ...baked(), animation: { body: { posX: samples, posY: Array(7).fill(0.04), posZ: samples } } }, identity, generatedModel, { stripRootHorizontal: true });
+    expect(clip.tracks.body.position?.[6]).toEqual([0, 0.04, 0]);
   });
 
   it('rejects unsupported effects and malformed model definitions', () => {
@@ -546,6 +667,27 @@ describe('CG HTTP API', () => {
     expect(await (await fetch(`${base}/projects`)).json()).toMatchObject({ projects: [{ id: project.id, confirmed: true }] });
     expect(await (await fetch(`${base}/projects/${project.id}/progress`)).json()).toMatchObject({ stage: 'ready', running: false });
     expect((await fetch(`${base}/capabilities`)).status).toBe(200);
+  });
+
+  it('exposes durable one-click runs and their immutable artifacts', async () => {
+    let response = await post(`${base}/projects`, { map: mapFixture(), scheme: null });
+    let project: CgProject = await response.json();
+    response = await post(`${base}/projects/${project.id}/runs`, { revision: project.revision, prompt: '角色走向场景中央，镜头跟随并切换到特写。', demo: true });
+    expect(response.status).toBe(200);
+    const generated = await response.json();
+    project = generated.project;
+    expect(generated.run).toMatchObject({ projectId: project.id, status: 'preview-ready', phase: 'preview-ready' });
+    expect(project.candidate!.validation.valid).toBe(true);
+    const history = await (await fetch(`${base}/projects/${project.id}/runs`)).json();
+    expect(history.runs[0].id).toBe(generated.run.id);
+    const reopened = await (await fetch(`${base}/projects/${project.id}/runs/${generated.run.id}`)).json();
+    expect(reopened.tasks.every((task: { status: string }) => task.status === 'completed')).toBe(true);
+    const artifactId = reopened.artifacts.find((item: { kind: string }) => item.kind === 'world-knowledge').id;
+    const artifact = await (await fetch(`${base}/projects/${project.id}/runs/${generated.run.id}/artifacts/${artifactId}`)).json();
+    expect(artifact).toMatchObject({ id: artifactId, producer: 'world', content: { mapId: mapFixture().id } });
+    response = await post(`${base}/projects/${project.id}/confirm`, { revision: project.revision, compileId: project.candidate!.id, inputHash: project.candidate!.inputHash });
+    expect(response.status).toBe(200);
+    expect((await (await fetch(`${base}/projects/${project.id}/runs/${generated.run.id}`)).json()).status).toBe('confirmed');
   });
 
   it('syncs the current WorldForge snapshot through the project API and invalidates only the candidate', async () => {

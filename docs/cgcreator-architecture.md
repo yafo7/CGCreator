@@ -1,5 +1,7 @@
 # CGCreator V1 架构
 
+当前一键多 Agent 生成、Run/Artifact、准备门、摄影与表演协商、定向修复和恢复协议见 [CGCreator 多 Agent 生成内核](./cgcreator-multi-agent-runtime.md)。本页继续说明 WorldForge 集成、确定性编译和编辑约束。
+
 V2 基础闭环的当前实现见 [基础演出闭环](./cgcreator-foundation.md)。旧版章节保留为兼容说明；新文档通过行为验证后再进入镜头覆盖阶段。
 
 当前地图精确理解增量见 [导演地图理解](./cgcreator-world-understanding.md)：完整区域关系、可计算边界、来源与缺口、导演只读查询，以及地图同步后重新读取。

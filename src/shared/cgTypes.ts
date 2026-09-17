@@ -34,7 +34,7 @@ export interface CgEntity {
 export type CgTimeRef = { kind: 'absolute'; seconds: number }
   | { kind: 'after' | 'with'; id: string; offset?: number };
 export interface CgCameraIntent {
-  movement: 'static' | 'dolly' | 'tracking' | 'orbit';
+  movement: 'static' | 'dolly' | 'tracking' | 'orbit' | 'crane';
   framing: 'wide' | 'medium' | 'close-up' | 'over-shoulder';
   subjectId: string;
   secondaryId?: string;
@@ -77,7 +77,9 @@ export interface CgShot {
 export interface CgAction {
   id: string;
   entityId: string;
-  type: 'move' | 'face' | 'animate' | 'visibility' | 'effect' | 'attach' | 'detach' | 'sit' | 'stand' | 'dialogue' | 'hold';
+  /** `airborne` owns a cinematic world-space arc. `attach` and `handoff`
+   * own a prop's deterministic attachment state. */
+  type: 'move' | 'airborne' | 'face' | 'animate' | 'visibility' | 'effect' | 'attach' | 'detach' | 'handoff' | 'sit' | 'stand' | 'dialogue' | 'hold';
   start: CgTimeRef;
   duration: number;
   targetAnchorId?: string;
@@ -86,8 +88,15 @@ export interface CgAction {
   visible?: boolean;
   effect?: 'spark';
   socketId?: string;
+  /** Source actor for a prop handoff. The action entity itself is the prop. */
+  sourceEntityId?: string;
+  /** How high the apex of an airborne trajectory is above its two endpoints. */
+  arcHeight?: number;
   route?: { guideIds: string[]; policy: 'required' | 'preferred'; locomotion: 'walk' | 'run'; maxSpeed?: number };
   interaction?: { objectId: string; seatNodeId: string; approachAnchorId: string };
+  /** Prop whose mounted variant informed this actor motion. The rendered prop
+   * remains a single CG entity; it is never duplicated inside the actor. */
+  propEntityId?: string;
   endBehavior?: 'restore' | 'hold';
   purpose?: string;
 }
@@ -129,7 +138,7 @@ export interface CgClip {
   fps: number;
   loop: boolean;
   rootMotion: 'in-place';
-  source: 'generated' | 'builtin';
+  source: 'generated' | 'builtin' | 'procedural-fallback';
   locomotion?: { kind: 'walk' | 'run'; nominalSpeed: number; minRate: number; maxRate: number };
   tracks: Record<string, {
     position?: CgVec3[];
@@ -138,7 +147,24 @@ export interface CgClip {
     scale?: CgVec3[];
   }>;
 }
-export interface CgResources { models: MapAsset[]; clips: CgClip[] }
+/** A socket measured from a 3d-generate mount result. The transform is local
+ * to a real actor model node and therefore follows that node's baked pose. */
+export interface CgAssemblyProfile {
+  id: string;
+  actorEntityId: string;
+  propEntityId: string;
+  socketId: string;
+  nodeId: string;
+  position: CgVec3;
+  quaternion: CgQuat;
+  scale: CgVec3;
+  mountedGroupId: string;
+  actorModelHash: string;
+  propModelHash: string;
+  source: '3d-generate-mount' | 'semantic-node-fallback';
+  issue?: string;
+}
+export interface CgResources { models: MapAsset[]; clips: CgClip[]; assemblies?: CgAssemblyProfile[] }
 export interface CgDiagnostic {
   severity: 'error' | 'warning';
   code: string;
@@ -156,6 +182,8 @@ export interface CgEntityState {
   clipWeight?: number;
   attachedTo?: string;
   socketId?: string;
+  /** Runtime-only continuous prop transfer between two measured grips. */
+  handoff?: { sourceEntityId: string; targetEntityId: string; sourceSocketId: string; targetSocketId: string; progress: number };
   posture?: 'standing' | 'seated';
   behaviorId?: string;
   landmarks?: Partial<Record<'eyes' | 'face' | 'head' | 'hips' | 'leftFoot' | 'rightFoot', CgVec3>>;

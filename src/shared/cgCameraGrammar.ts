@@ -13,6 +13,7 @@ export const CG_CAMERA_GRAMMAR = {
     travelContext: { framing: 'wide', movement: 'tracking', reference: 'subject-motion', views: ['side', 'rear-three-quarter'], aim: 'body' },
     travelDestination: { framing: 'wide', movement: 'tracking', reference: 'subject-motion', views: ['rear', 'rear-three-quarter'], aim: 'body' },
     movingEmotion: { framing: 'medium', movement: 'tracking', reference: 'subject-motion', views: ['front-three-quarter'], aim: 'upper-body', requiresExplicitEmotionReason: true },
+    highReveal: { framing: 'wide', movement: 'crane', reference: 'world', views: ['side', 'rear-three-quarter'], aim: 'body', requiresRevealReason: true },
     reaction: { framing: 'close-up', movement: 'static', reference: 'subject-facing', views: ['front-three-quarter', 'front'], aim: 'eyes', lensMm: [70, 100] },
     physicalInteraction: { framing: 'medium', movement: 'tracking', reference: 'subject-facing', views: ['side', 'front-three-quarter'], aim: 'upper-body' },
     dialogue: { framing: 'over-shoulder', movement: 'static', reference: 'interaction-axis', views: ['front-three-quarter'], aim: 'face' }

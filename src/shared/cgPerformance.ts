@@ -1,4 +1,4 @@
-import { Euler, Quaternion, Vector3 } from 'three';
+import { Euler, Matrix4, Quaternion, Vector3 } from 'three';
 import { sampleTerrainHeight } from './map';
 import { samplePath, sampleSmoothPath } from './cgPath';
 import { bakedFrameIndex, evaluateRig, poseMatrix } from './cgPoseEvaluator';
@@ -44,11 +44,11 @@ export function sampleEntities(bundle: CompiledCG, time: number): Record<string,
     if (time < action.start) continue;
     const state = entities[action.entityId]; if (!state) continue;
     const u = action.end > action.start ? Math.max(0, Math.min(1, (time - action.start) / (action.end - action.start))) : 1;
-    if (modern && ['move', 'sit', 'dialogue', 'hold'].includes(action.type)) state.behaviorId = action.id;
-    if (action.type === 'move' && action.path) {
+    if (modern && ['move', 'airborne', 'sit', 'dialogue', 'handoff', 'hold'].includes(action.type)) state.behaviorId = action.id;
+    if ((action.type === 'move' || action.type === 'airborne') && action.path) {
       const sampled = action.pathInterpolation === 'smooth' ? sampleSmoothPath(action.path, u) : samplePath(action.path, u);
       state.position = sampled.position;
-      if (action.pathInterpolation === 'smooth' && !action.surfaceIds) state.position[1] = sampleTerrainHeight(bundle.map, state.position[0], state.position[2]);
+      if (action.type === 'move' && action.pathInterpolation === 'smooth' && !action.surfaceIds) state.position[1] = sampleTerrainHeight(bundle.map, state.position[0], state.position[2]);
       if (Math.hypot(sampled.direction[0], sampled.direction[2]) > 1e-7) state.quaternion = yaw(sampled.direction[0], sampled.direction[2]);
       if (modern && action.clipId && time < action.end) {
         const clip = bundle.resources.clips.find(c => c.id === action.clipId);
@@ -57,8 +57,18 @@ export function sampleEntities(bundle: CompiledCG, time: number): Record<string,
           if (action.motionBlend) { const w = Math.max(0, Math.min(1, (time - action.start) / action.motionBlend, (action.end - time) / action.motionBlend)); state.clipWeight = w * w * (3 - 2 * w); }
         }
       }
+    } else if (action.type === 'attach' && action.targetEntityId) {
+      state.attachedTo = action.targetEntityId; state.socketId = action.socketId; delete state.handoff;
+    } else if (action.type === 'detach') {
+      delete state.attachedTo; delete state.socketId; delete state.handoff;
+    } else if (action.type === 'handoff' && action.sourceEntityId && action.targetEntityId) {
+      state.attachedTo = u < 0.5 ? action.sourceEntityId : action.targetEntityId;
+      state.socketId = u < 0.5 ? 'right-hand' : action.socketId;
+      state.handoff = { sourceEntityId: action.sourceEntityId, targetEntityId: action.targetEntityId, sourceSocketId: 'right-hand', targetSocketId: action.socketId ?? 'right-hand', progress: u };
     } else if (action.type === 'face' && action.to && action.from) {
-      state.quaternion = new Quaternion().setFromEuler(new Euler(...action.from)).slerp(new Quaternion(...yaw(action.to[0], action.to[2])), u).toArray();
+      const from = new Quaternion().setFromEuler(new Euler(...action.from));
+      const to = new Quaternion().fromArray(yaw(action.to[0], action.to[2]));
+      state.quaternion = from.slerp(to, u).normalize().toArray();
     } else if (action.type === 'visibility') state.visible = action.visible!;
     else if (modern && action.type === 'sit' && action.rootSamples && action.contact) {
       const samples = action.rootSamples, f = bakedFrameIndex(time - action.start, action.duration, samples.fps, samples.positions.length), a = Math.floor(f), b = Math.min(a + 1, samples.positions.length - 1);
@@ -72,12 +82,14 @@ export function sampleEntities(bundle: CompiledCG, time: number): Record<string,
       if (Math.hypot(dx, dz) > 1e-6) state.quaternion = yaw(dx, dz);
     } else if (action.type === 'animate' && (time <= action.end || modern && action.endBehavior === 'hold')) {
       const clip = bundle.resources.clips.find(c => c.id === action.clipId);
-      if (clip) { const elapsed = Math.max(0, time - action.start); state.clipId = clip.id; state.clipTime = time > action.end ? clip.duration : clip.loop ? elapsed % clip.duration : Math.min(elapsed, clip.duration); }
+      if (clip) { const elapsed = Math.max(0, time - action.start) * (action.playbackRate ?? 1); state.clipId = clip.id; state.clipTime = time > action.end ? clip.duration : clip.loop ? elapsed % clip.duration : Math.min(elapsed, clip.duration); }
     }
   }
+  const rigMatrices = new Map<string, Map<string, Matrix4>>(), rootMatrices = new Map<string, Matrix4>();
   if (modern) for (const binding of bundle.bindings) {
     const state = entities[binding.entityId], rig = binding.poseRig; if (!state || !rig) continue;
     const clip = bundle.resources.clips.find(c => c.id === state.clipId), matrices = evaluateRig(rig, clip, state.clipTime ?? 0, state.clipWeight ?? 1), root = poseMatrix(state);
+    rigMatrices.set(binding.entityId, matrices); rootMatrices.set(binding.entityId, root);
     state.landmarks = {};
     for (const [name, target] of Object.entries(rig.landmarks)) {
       const matrix = target && matrices.get(target.nodeId);
@@ -85,6 +97,47 @@ export function sampleEntities(bundle: CompiledCG, time: number): Record<string,
     }
     const face = rig.landmarks.face ?? rig.landmarks.eyes;
     if (face && matrices.has(face.nodeId)) state.faceForward = new Vector3(0, 0, 1).transformDirection(root.clone().multiply(matrices.get(face.nodeId)!)).toArray();
+  }
+  // Attachments are a final pose-aware pass. New projects use the exact
+  // actor-node socket measured from a 3d-generate mount result. The height
+  // offset remains only for legacy bundles created before assembly profiles.
+  for (const [propEntityId, state] of Object.entries(entities)) {
+    if (!state.attachedTo) continue;
+    const owner = entities[state.attachedTo];
+    if (!owner) continue;
+    const mountedPose = (actorEntityId: string, socketId: string) => {
+      const profile = bundle.resources.assemblies?.find(item => item.actorEntityId === actorEntityId && item.propEntityId === propEntityId && item.socketId === socketId);
+      const node = profile && rigMatrices.get(actorEntityId)?.get(profile.nodeId), root = profile && rootMatrices.get(actorEntityId);
+      if (!profile || !node || !root) return undefined;
+      const matrix = root.clone().multiply(node).multiply(poseMatrix(profile)), position = new Vector3(), quaternion = new Quaternion(), scale = new Vector3();
+      matrix.decompose(position, quaternion, scale);
+      return { position, quaternion, scale };
+    };
+    if (state.handoff) {
+      const source = mountedPose(state.handoff.sourceEntityId, state.handoff.sourceSocketId), target = mountedPose(state.handoff.targetEntityId, state.handoff.targetSocketId);
+      if (source && target) {
+        const u = state.handoff.progress * state.handoff.progress * (3 - 2 * state.handoff.progress);
+        state.position = source.position.lerp(target.position, u).toArray();
+        state.quaternion = source.quaternion.slerp(target.quaternion, u).toArray();
+        state.scale = source.scale.lerp(target.scale, u).toArray();
+        continue;
+      }
+    }
+    const profile = bundle.resources.assemblies?.find(item => item.actorEntityId === state.attachedTo && item.propEntityId === propEntityId && item.socketId === (state.socketId ?? 'right-hand'));
+    const node = profile && rigMatrices.get(state.attachedTo)?.get(profile.nodeId), root = profile && rootMatrices.get(state.attachedTo);
+    if (profile && node && root) {
+      const world = root.clone().multiply(node).multiply(poseMatrix(profile));
+      const position = new Vector3(), quaternion = new Quaternion(), scale = new Vector3();
+      world.decompose(position, quaternion, scale);
+      state.position = position.toArray(); state.quaternion = quaternion.toArray(); state.scale = scale.toArray();
+      continue;
+    }
+    const height = bundle.bindings.find(binding => binding.entityId === state.attachedTo)?.height ?? 1.8;
+    const socket = state.socketId ?? 'right-hand';
+    const local: CgVec3 = socket.includes('back') ? [0, height * 0.62, -0.18] : [socket.includes('left') ? -0.30 : 0.30, height * 0.62, 0.12];
+    const offset = new Vector3(...local).applyQuaternion(new Quaternion(...owner.quaternion));
+    state.position = new Vector3(...owner.position).add(offset).toArray();
+    state.quaternion = [...owner.quaternion];
   }
   return entities;
 }

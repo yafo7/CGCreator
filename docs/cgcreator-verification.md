@@ -32,3 +32,11 @@
 - 人工摄影机路径在编译器 `cgcreator-1.4.0` 中采用按弧长求值的 centripetal Catmull-Rom 曲线；两点和旧编译结果保持线性。镜头位置曲线不接管语义注视目标与构图。
 - 人工 NPC 途经点启用平滑求值，位置逐帧投影到冻结地形；编译时采样检查可玩区域与静态碰撞，不能安全平滑时产生 `smoothed_route_blocked` 错误。
 - 专项测试 28 项通过；完成改动后的完整测试为 107 个测试文件、781 项测试通过。TypeScript、生产构建、map-core smoke 和 WorldForge baseline 检查通过。
+
+## 多 Agent 生成内核验收（2026-09-16）
+
+- 一键入口执行 `World bootstrap → Preproduction → World/Production 并行 → Readiness Gate → Final Director → Performance → Camera → Negotiation → Compile → Validate → Preview`，Run 和不可变 Artifact 均持久化；服务重启后的恢复测试通过。
+- 自编演出测试：“青衣少女沿园林石子路走到池塘边；提灯老人从凉亭方向走来并举灯；少女转身点头；镜头从两人身后升起并揭示园林。”通过注入的 3d-generate 协议适配器完成，不消耗远程额度；最终候选有效，包含 3 个模型、4 个标记为 `generated` 的动作、1 个 `3d-generate-mount` 装配、两条 WorldForge guide 走位和最终 crane 镜头。步态未提供标称速度时保留明确 warning。
+- 修复并发表演的自动镜头边界：镜头以“下一个有效叙事节点”切分，不再用重叠行为结束时间产生零或负时长。
+- 完整测试：112 个测试文件、836 项测试通过。`npm run build` 通过；仅保留既有主包体积提示。`npm run verify:worldforge` 通过：511 个上游文件中仅 13 个登记集成文件不同。
+- 浏览器在“中式园林9（导入）”上通过一键 Run 生成 11 秒演出；UI 显示 12 个 Agent 任务全部完成、实时播放到 11 秒、确认成功、Run 状态变为 `confirmed`、导出按钮启用。开发服务终端无运行时错误。

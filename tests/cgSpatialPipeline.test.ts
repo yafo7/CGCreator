@@ -9,7 +9,7 @@ import { createNavigationWorld, findNavigationPath } from '../src/shared/cgNavig
 import { observeCamera } from '../src/shared/cgVisibility';
 import { mapSpatialAnchors, resolveSpatialAnchor } from '../src/shared/cgSpatialBindings';
 import { cameraCandidates } from '../src/shared/cgShotSkills';
-import type { CgEntityState } from '../src/shared/cgTypes';
+import type { CgClip, CgEntityState } from '../src/shared/cgTypes';
 
 const errors = (fixture: ReturnType<typeof createFoundationDemo>) => compileDirector(fixture.document, fixture.map, null, fixture.resources, undefined, { performanceOnly: true }).validation.diagnostics.filter(d => d.severity === 'error').map(d => d.code);
 
@@ -43,9 +43,70 @@ describe('spatial performance constraints', () => {
     f.document.actions.push({ id: 'invalid-leave', entityId: 'boy', type: 'move', start: { kind: 'after', id: 'sit' }, duration: 1, targetAnchorId: 'approach' });
     expect(errors(f)).toContain('seated_behavior_conflict');
   });
+  it('accepts synchronized handoff motions even when the handoff sorts first', () => {
+    const f = createFoundationDemo();
+    const propModel = { version: '1.0', nodes: [{ id: 'blade', name: 'blade', transform: { pos: [0, 0.4, 0] }, mesh: { type: 'box', params: { width: 0.08, height: 0.8, depth: 0.04 } } }] };
+    const propAsset: MapAsset = { id: 'sword-asset', name: '长剑', prompt: '古风长剑', modelJson: propModel, colliderPlan: buildModelColliderPlan(propModel), mode: 'json', createdAt: 1, updatedAt: 1 };
+    f.resources.models.push(propAsset);
+    f.document.entities.push({ id: 'sword', name: '长剑', kind: 'prop', assetId: propAsset.id });
+    const motion = (id: string, entityId: string): CgClip => ({
+      id, entityId, modelHash: stableHash(f.map.assets![0].modelJson), description: '交接长剑', duration: 1, fps: 1,
+      loop: false, rootMotion: 'in-place' as const, source: 'builtin' as const,
+      tracks: { right_arm: { rotation: [[0, 0, 0], [0, 0, 0]] } }
+    });
+    f.resources.clips.push(motion('giver-handoff', 'boy'), motion('receiver-handoff', 'friend'));
+    const actorHash = stableHash(f.map.assets![0].modelJson), propHash = stableHash(propModel);
+    f.resources.assemblies = [
+      { id: 'giver-grip', actorEntityId: 'boy', propEntityId: 'sword', socketId: 'right-hand', nodeId: 'right_arm', position: [0, 0, 0], quaternion: [0, 0, 0, 1], scale: [1, 1, 1], mountedGroupId: 'blade', actorModelHash: actorHash, propModelHash: propHash, source: '3d-generate-mount' },
+      { id: 'receiver-grip', actorEntityId: 'friend', propEntityId: 'sword', socketId: 'right-hand', nodeId: 'right_arm', position: [0, 0, 0], quaternion: [0, 0, 0, 1], scale: [1, 1, 1], mountedGroupId: 'blade', actorModelHash: actorHash, propModelHash: propHash, source: '3d-generate-mount' }
+    ];
+    f.document.actions = [
+      { id: 'a-handoff-first', entityId: 'sword', type: 'handoff', sourceEntityId: 'boy', targetEntityId: 'friend', socketId: 'right-hand', start: { kind: 'absolute', seconds: 0 }, duration: 1 },
+      { id: 'z-giver-motion', entityId: 'boy', type: 'animate', propEntityId: 'sword', clipId: 'giver-handoff', start: { kind: 'absolute', seconds: 0 }, duration: 1 },
+      { id: 'z-receiver-motion', entityId: 'friend', type: 'animate', propEntityId: 'sword', clipId: 'receiver-handoff', start: { kind: 'absolute', seconds: 0 }, duration: 1 }
+    ];
+    f.document.shots = [{ id: 'handoff-shot', name: '交接', purpose: '完整展示交接', duration: 1, behaviorId: 'a-handoff-first', camera: { movement: 'static', framing: 'medium', layout: 'two-shot', subjectId: 'boy', secondaryId: 'friend', reference: 'interaction-axis', view: 'side', aim: 'interaction', aimMode: 'follow' } }];
+    const diagnostics = compileDirector(f.document, f.map, null, f.resources, undefined, { performanceOnly: true }).validation.diagnostics;
+    expect(diagnostics.some(item => item.code === 'missing_handoff_motion')).toBe(false);
+  });
   it('detects an actor occupying another actor’s travel space', () => {
     const f = createFoundationDemo(); f.map.objects.find(o => o.id === 'friend-object')!.transform.position = [-2, 0, -4];
     expect(errors(f)).toContain('performer_clearance_conflict');
+  });
+  it('does not treat a map-bound scenery prop with no actions as an animated performer', () => {
+    const f = createFoundationDemo();
+    const prop = createMapObject('scenery', 'foundation-chair'); prop.id = 'scenery-prop-object'; prop.transform.position = [8, 0, 8];
+    const neighbor = createMapObject('neighbor', 'foundation-chair'); neighbor.id = 'scenery-neighbor'; neighbor.transform.position = [8, 0, 8];
+    f.map.objects.push(prop, neighbor);
+    f.document.entities.push({ id: 'scenery-prop', name: '静态景物', kind: 'prop', objectId: prop.id });
+    const diagnostics = compileDirector(f.document, f.map, null, f.resources, undefined, { performanceOnly: true }).validation.diagnostics;
+    expect(diagnostics.some(item => item.code === 'animated_world_clearance' && item.nodeIds.includes('scenery-prop'))).toBe(false);
+  });
+  it('finishes a face action looking at the world position of a map-bound prop', () => {
+    const f = createFoundationDemo();
+    f.map.objects.find(object => object.id === 'chair-object')!.transform.position = [-10, 0, -10];
+    f.document.entities.push({ id: 'pavilion', name: '临波水榭', kind: 'prop', objectId: 'chair-object' });
+    f.resources.clips.push({ id: 'held-head-turn', entityId: 'boy', modelHash: stableHash(f.map.assets![0].modelJson), description: '停步后保留头部偏转', duration: 1, fps: 1, loop: false, rootMotion: 'in-place', source: 'builtin', tracks: { head: { rotation: [[0, Math.PI / 3, 0], [0, Math.PI / 3, 0]] } } });
+    f.document.actions = [
+      { id: 'stop-with-head-turn', entityId: 'boy', type: 'animate', start: { kind: 'absolute', seconds: 0 }, duration: 1, clipId: 'held-head-turn', endBehavior: 'hold' },
+      { id: 'look-at-pavilion', entityId: 'boy', type: 'face', start: { kind: 'after', id: 'stop-with-head-turn' }, duration: 1, targetEntityId: 'pavilion' }
+    ];
+    f.document.shots = [{ id: 'look', name: '回望', purpose: '看向临波水榭', duration: 1, behaviorId: 'look-at-pavilion', autoDuration: true, camera: { movement: 'static', framing: 'close-up', subjectId: 'boy', reference: 'subject-facing', view: 'front-three-quarter', aim: 'eyes', aimMode: 'follow', lensMm: 85 } }];
+    const bundle = compileDirector(f.document, f.map, null, f.resources, undefined, { performanceOnly: true });
+    const state = evaluateCG(bundle, 2).entities.boy;
+    const target = f.map.objects.find(object => object.id === 'chair-object')!.transform.position;
+    const expected = new Vector3(target[0] - state.position[0], 0, target[2] - state.position[2]).normalize();
+    const forward = new Vector3(...state.faceForward!).setY(0).normalize();
+    expect(forward.dot(expected)).toBeGreaterThan(0.999);
+    expect(new Quaternion(...state.quaternion).length()).toBeCloseTo(1, 8);
+    const complete = compileDirector(f.document, f.map, null, f.resources);
+    expect(complete.validation.diagnostics.filter(item => item.severity === 'error')).toEqual([]);
+    expect(complete.shots[0].camera.movement).toBe('tracking');
+    for (const time of [1, 1.5, 2]) {
+      const frame = evaluateCG(complete, time), actor = frame.entities.boy;
+      const eye = actor.landmarks!.eyes!;
+      expect(new Vector3(...frame.camera.position).sub(new Vector3(...eye)).normalize().dot(new Vector3(...actor.faceForward!))).toBeGreaterThan(0.1);
+    }
   });
   it('rebases semantic guide/seat anchors while preserving exact world anchors', () => {
     const f = createFoundationDemo(), anchors = mapSpatialAnchors(f.map), guide = anchors.find(a => a.binding?.kind === 'guide')!, seat = anchors.find(a => a.binding?.kind === 'seat-approach')!;

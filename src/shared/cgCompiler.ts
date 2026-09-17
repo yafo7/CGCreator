@@ -18,7 +18,7 @@ import { resolveSpatialAnchor } from './cgSpatialBindings';
 import { validatePerformanceClearance } from './cgPerformanceValidation';
 
 export { stableHash, validateDirectorDocument } from './cgValidation';
-export const CG_COMPILER_VERSION = 'cgcreator-2.0.3';
+export const CG_COMPILER_VERSION = 'cgcreator-2.1.0';
 const clone = <T>(value: T): T => structuredClone(value);
 const clamp01 = (n: number) => Math.min(1, Math.max(0, n));
 const quat = (rotation: CgVec3): CgQuat => new Quaternion().setFromEuler(new Euler(...rotation)).toArray() as CgQuat;
@@ -136,7 +136,7 @@ export function compileDirector(document: DirectorDocument, map: EditableMap, sc
   if (bundle.bindings.length !== document.entities.length) return finish();
   const collisionMap = clone(bundle.map);
   const staticProps = new Set(document.entities.filter((e) => e.kind === 'prop'
-    && !document.actions.some((a) => a.entityId === e.id && ['move', 'face', 'animate', 'visibility', 'sit', 'dialogue'].includes(a.type)))
+    && !document.actions.some((a) => a.entityId === e.id && ['move', 'airborne', 'face', 'animate', 'visibility', 'sit', 'dialogue', 'attach', 'detach', 'handoff'].includes(a.type)))
     .map((e) => bundle.bindings.find((b) => b.entityId === e.id)!.objectId));
   collisionMap.objects = collisionMap.objects.filter((o) => !boundObjects.has(o.id) || staticProps.has(o.id));
   delete collisionMap.collisionBake;
@@ -153,10 +153,13 @@ export function compileDirector(document: DirectorDocument, map: EditableMap, sc
     if (performanceSchedule.diagnostics.length) return finish();
   }
   let shotStart = 0;
-  for (const shot of document.shots) {
+  for (const [shotIndex, shot] of document.shots.entries()) {
     const lockedDuration = single(constraints('shot-duration', shot.id), (c) => c.seconds);
-    const behaviorEnd = shot.behaviorId ? performanceSchedule?.times.get(shot.behaviorId)?.end : undefined;
-    const duration = lockedDuration?.seconds ?? (shot.autoDuration && behaviorEnd !== undefined ? behaviorEnd - shotStart : shot.duration);
+    const nextBehaviorStart = shot.autoDuration && performanceSchedule
+      ? document.shots.slice(shotIndex + 1).map(next => next.behaviorId ? performanceSchedule.times.get(next.behaviorId)?.start : undefined).find((time): time is number => time !== undefined && time > shotStart + 1e-6)
+      : undefined;
+    const autoEnd = nextBehaviorStart ?? performanceSchedule?.duration;
+    const duration = lockedDuration?.seconds ?? (shot.autoDuration && autoEnd !== undefined ? autoEnd - shotStart : shot.duration);
     if (duration <= 0 || duration > 300) { diagnostic('coverage_time_conflict', '镜头覆盖与行为时间或镜头时长锁冲突。', [shot.id]); return finish(); }
     const hard = positionConstraint('camera-pose', shot.id), anchor = hard ? anchors.get(hard.anchorId!) : undefined;
     const compiled: CgCompiledShot = { id: shot.id, start: shotStart, end: shotStart + duration, camera: clone(shot.camera), transition: clone(shot.transition), inputHash: '', ...(shot.behaviorId ? { behaviorId: shot.behaviorId } : {}), ...(shot.skillId ? { skillId: shot.skillId } : {}) };
@@ -183,9 +186,10 @@ export function compileDirector(document: DirectorDocument, map: EditableMap, sc
     const source = document.shots.find(s => s.id === shot.id)!, action = document.actions.find(a => a.id === source.behaviorId);
     const span = action && performanceSchedule.times.get(action.id);
     if (!action || !span) continue;
-    if (source.coveragePurpose === 'contact' && (action.type !== 'sit' || span.end < shot.start || span.end > shot.end)) diagnostic('contact_not_covered', '接触镜头必须覆盖实际坐下接触时刻。', [shot.id, action.id]);
+    if (source.coveragePurpose === 'contact' && action.type === 'sit' && (span.end < shot.start || span.end > shot.end)) diagnostic('contact_not_covered', '接触镜头必须覆盖实际坐下接触时刻。', [shot.id, action.id]);
     if (['follow', 'destination', 'dialogue'].includes(source.coveragePurpose ?? '') && (shot.end <= span.start || shot.start >= span.end)) diagnostic('coverage_misses_behavior', '镜头时间没有覆盖其关联行为。', [shot.id, action.id]);
-    if (['follow', 'destination', 'contact'].includes(source.coveragePurpose ?? '') && shot.camera.subjectId !== action.entityId) diagnostic('coverage_subject_mismatch', '该镜头的主体与需要展示的行为角色不一致。', [shot.id, action.id]);
+    const coverageSubject = action.type === 'handoff' ? action.sourceEntityId : action.entityId;
+    if (['follow', 'destination', 'contact'].includes(source.coveragePurpose ?? '') && shot.camera.subjectId !== coverageSubject) diagnostic('coverage_subject_mismatch', '该镜头的主体与需要展示的行为角色不一致。', [shot.id, action.id]);
     if (action.type === 'dialogue' && ['two-shot', 'over-shoulder'].includes(shot.camera.layout ?? '') && [shot.camera.subjectId, shot.camera.secondaryId].sort().join('|') !== [action.entityId, action.targetEntityId].sort().join('|')) diagnostic('dialogue_coverage_mismatch', '双人镜头必须绑定这段对话的实际参与者。', [shot.id, action.id]);
   }
   const resolving = new Set<string>();
@@ -214,13 +218,18 @@ export function compileDirector(document: DirectorDocument, map: EditableMap, sc
   const sortedActions = [...document.actions].sort((a, b) => timings.get(a.id)!.start - timings.get(b.id)!.start || a.id.localeCompare(b.id));
   const clips = new Map(resources.clips.map((c) => [c.id, c]));
   if (clips.size !== resources.clips.length) diagnostic('duplicate_clip', 'Clip IDs must be unique.');
+  if (bundle.evaluationVersion === 2) for (const clip of resources.clips) {
+    if (clip.source === 'procedural-fallback') diagnostic('motion_generation_fallback', `3d-generate 动作生成不可用；${clip.id} 使用基于真实模型语义节点的确定性降级动作。`, [clip.id], 'warning');
+  }
   for (const action of sortedActions) {
     const interval = timings.get(action.id)!;
     const compiled: CgCompiledAction = { ...clone(action), ...interval, duration: interval.end - interval.start, inputHash: '' };
     const binding = bundle.bindings.find((b) => b.entityId === action.entityId)!;
     const prior = bundle.actions.filter((a) => a.entityId === action.entityId);
-    const channel = (a: { type: CgAction['type'] }) => ['move', 'face', 'sit', 'dialogue'].includes(a.type) ? 'root' : a.type;
-    const overlap = prior.find((a) => channel(a) === channel(action) && a.start < interval.end - 1e-6 && a.end > interval.start + 1e-6);
+    const channel = (a: { type: CgAction['type'] }) => ['move', 'airborne', 'face', 'sit', 'dialogue'].includes(a.type) ? 'root' : a.type;
+    // `hold` is a semantic coverage/state marker and does not write a pose or
+    // transform channel. Overlapping holds are redundant but executable.
+    const overlap = action.type === 'hold' ? undefined : prior.find((a) => channel(a) === channel(action) && a.start < interval.end - 1e-6 && a.end > interval.start + 1e-6);
     if (overlap) diagnostic('action_channel_overlap', `Actions ${overlap.id} and ${action.id} compete for the same entity channel.`, [overlap.id, action.id]);
     const dependencies = [action.entityId, ...(action.start.kind !== 'absolute' ? [action.start.id] : []), ...constraints('action-time', action.id).map((c) => c.id)];
     const state = sampleEntities(bundle, interval.start)[action.entityId];
@@ -233,7 +242,23 @@ export function compileDirector(document: DirectorDocument, map: EditableMap, sc
     if (bundle.evaluationVersion === 2 && prior.some(a => a.start < interval.end && a.end > interval.start && ((a.type === 'sit' && action.type === 'animate') || (a.type === 'animate' && action.type === 'sit')))) diagnostic('contact_animation_overlap', '坐下行为独占全身姿态，不能同时叠加另一条动画。', [action.id]);
     const ownsPose = (a: { type: CgAction['type']; clipId?: string }) => ['sit', 'animate'].includes(a.type) || a.type === 'move' && !!a.clipId;
     if (bundle.evaluationVersion === 2 && ownsPose(action) && prior.some(a => ownsPose(a) && a.start < interval.end && a.end > interval.start)) diagnostic('pose_channel_overlap', '同一角色的全身姿态轨道存在重叠；道路步态和交互不能再叠加另一条全身动画。', [action.id]);
-    if (action.type === 'move') {
+    if (action.type === 'airborne') {
+      const target = anchors.get(action.targetAnchorId ?? '');
+      if (!target) diagnostic('missing_target', 'Airborne landing anchor cannot be resolved.', [action.id]);
+      else {
+        const from = new Vector3(...state.position), to = new Vector3(...target.position);
+        const apex = Math.max(action.arcHeight ?? Math.max(1.2, from.distanceTo(to) * 0.22), 0.25);
+        const middle = from.clone().lerp(to, 0.5); middle.y = Math.max(from.y, to.y) + apex;
+        compiled.path = [from.toArray() as CgVec3, middle.toArray() as CgVec3, to.toArray() as CgVec3];
+        compiled.pathControls = [
+          { id: `auto-start:${action.id}`, position: [...state.position], role: 'start', source: 'auto' },
+          { id: `auto-apex:${action.id}`, position: middle.toArray() as CgVec3, role: 'via', source: 'auto' },
+          { id: target.id, position: [...target.position], role: 'end', source: 'auto' }
+        ];
+        compiled.pathInterpolation = 'smooth'; compiled.from = [...state.position]; compiled.to = [...target.position];
+        dependencies.push(target.id);
+      }
+    } else if (action.type === 'move') {
       const hard = positionConstraint('action-target', action.id);
       const target = anchors.get(hard?.anchorId ?? action.targetAnchorId ?? '');
       if (!target) diagnostic('missing_target', 'Move target anchor cannot be resolved.', [action.id]);
@@ -303,8 +328,58 @@ export function compileDirector(document: DirectorDocument, map: EditableMap, sc
     } else if (action.type === 'face') {
       const target = action.targetAnchorId ? anchors.get(action.targetAnchorId)?.position : sampleEntities(bundle, interval.start)[action.targetEntityId!]?.position;
       if (!target) diagnostic('missing_target', 'Facing target cannot be resolved.', [action.id]);
-      else { compiled.from = new Euler().setFromQuaternion(new Quaternion().fromArray(state.quaternion)).toArray().slice(0, 3) as CgVec3; compiled.to = [target[0] - state.position[0], 0, target[2] - state.position[2]]; }
+      else {
+        compiled.from = new Euler().setFromQuaternion(new Quaternion().fromArray(state.quaternion)).toArray().slice(0, 3) as CgVec3;
+        const desired = new Vector3(target[0] - state.position[0], 0, target[2] - state.position[2]);
+        // A held animation may leave the head rotated relative to the body.
+        // Solve the body yaw against the measured end-of-prior-actions face
+        // direction so the semantic face action actually looks at its target.
+        const endState = sampleEntities(bundle, interval.end)[action.entityId];
+        const rootForward = new Vector3(0, 0, 1).applyQuaternion(new Quaternion().fromArray(endState?.quaternion ?? state.quaternion)).setY(0);
+        const faceForward = endState?.faceForward ? new Vector3(...endState.faceForward).setY(0) : rootForward.clone();
+        if (desired.lengthSq() > 1e-12 && rootForward.lengthSq() > 1e-12 && faceForward.lengthSq() > 1e-12) {
+          const desiredYaw = Math.atan2(desired.x, desired.z);
+          const rootYaw = Math.atan2(rootForward.x, rootForward.z);
+          const faceYaw = Math.atan2(faceForward.x, faceForward.z);
+          const targetRootYaw = desiredYaw - Math.atan2(Math.sin(faceYaw - rootYaw), Math.cos(faceYaw - rootYaw));
+          compiled.to = [Math.sin(targetRootYaw), 0, Math.cos(targetRootYaw)];
+        } else compiled.to = desired.toArray() as CgVec3;
+      }
       dependencies.push(action.targetAnchorId ?? action.targetEntityId!, ...prior.filter((a) => a.type === 'move' || a.type === 'face').map((a) => a.id));
+    } else if (action.type === 'attach') {
+      if (!action.targetEntityId || !action.socketId) diagnostic('invalid_attachment', 'Attachment requires a prop owner and socket.', [action.id]);
+      else {
+        const assembly = resources.assemblies?.find(item => item.actorEntityId === action.targetEntityId && item.propEntityId === action.entityId && item.socketId === action.socketId);
+        if (bundle.evaluationVersion === 2 && !assembly) diagnostic('missing_assembly_profile', 'Attachment requires a verified 3d-generate mount profile for this actor, prop and socket.', [action.id]);
+        else {
+          if (assembly?.source === 'semantic-node-fallback') diagnostic('assembly_mount_fallback', `3d-generate Mount 不可用；${action.id} 使用真实模型语义节点挂点。`, [action.id], 'warning');
+          dependencies.push(action.targetEntityId, assembly?.id ?? action.socketId);
+        }
+      }
+    } else if (action.type === 'detach') {
+      dependencies.push(action.entityId);
+    } else if (action.type === 'handoff') {
+      if (!action.sourceEntityId || !action.targetEntityId || !action.socketId) diagnostic('invalid_handoff', 'Handoff requires exact source, target and receiving socket.', [action.id]);
+      else {
+        const giver = resources.assemblies?.find(item => item.actorEntityId === action.sourceEntityId && item.propEntityId === action.entityId && item.socketId === 'right-hand');
+        const receiver = resources.assemblies?.find(item => item.actorEntityId === action.targetEntityId && item.propEntityId === action.entityId && item.socketId === action.socketId);
+        if (bundle.evaluationVersion === 2 && (!giver || !receiver)) diagnostic('missing_handoff_assembly', 'Handoff requires verified giver and receiver grip profiles.', [action.id]);
+        else {
+          if (giver?.source === 'semantic-node-fallback' || receiver?.source === 'semantic-node-fallback') diagnostic('handoff_mount_fallback', '3d-generate Mount 不可用；交接使用双方真实模型语义节点挂点。', [action.id], 'warning');
+          dependencies.push(action.sourceEntityId, action.targetEntityId, giver?.id ?? 'right-hand', receiver?.id ?? action.socketId);
+        }
+        // Validate against the complete authored schedule instead of the partially
+        // compiled bundle. Actions with the same start time are sorted by id, so a
+        // handoff can legitimately compile before either participant's animation.
+        const participantMotion = (entityId: string) => document.actions.find(item => {
+          if (item.type !== 'animate' || item.entityId !== entityId || item.propEntityId !== action.entityId) return false;
+          const motionInterval = timings.get(item.id)!;
+          return motionInterval.start < interval.end && motionInterval.end > interval.start;
+        });
+        const giverMotion = participantMotion(action.sourceEntityId), receiverMotion = participantMotion(action.targetEntityId);
+        if (bundle.evaluationVersion === 2 && (!giverMotion || !receiverMotion)) diagnostic('missing_handoff_motion', 'Both handoff participants require synchronized prop-informed body animation.', [action.id]);
+        else dependencies.push(...[giverMotion?.id, receiverMotion?.id].filter((id): id is string => !!id));
+      }
     } else if (action.type === 'animate') {
       const clip = clips.get(action.clipId!);
       const asset = binding.assetId ? assetMap.get(binding.assetId) : undefined;
@@ -321,6 +396,7 @@ export function compileDirector(document: DirectorDocument, map: EditableMap, sc
           }
           for (const [channel, samples] of Object.entries(tracks)) if (!['position', 'rotation', 'scale', 'quaternion'].includes(channel) || !Array.isArray(samples) || !samples.length || Array.from(samples as readonly number[][]).some((sample) => !Array.isArray(sample) || sample.length !== (channel === 'quaternion' ? 4 : 3) || Array.from(sample).some((n) => !Number.isFinite(n)) || (channel === 'quaternion' && Math.abs(Math.hypot(...sample) - 1) > 0.001))) diagnostic('invalid_clip_samples', 'Baked animation contains invalid or non-unit quaternion samples.', [clip.id, nodeId]);
         }
+        compiled.playbackRate = clip.duration / Math.max(1e-6, compiled.duration);
         dependencies.push(clip.id);
       }
     }
@@ -335,6 +411,10 @@ export function compileDirector(document: DirectorDocument, map: EditableMap, sc
     if (entity.kind !== 'actor') continue;
     const binding = bundle.bindings.find((b) => b.entityId === entity.id)!;
     const radius = Math.max(0.12, Math.min(0.6, binding.height * 0.19));
+    // A launch point may deliberately be a roof or another non-walkable
+    // surface. Its exact landing is still validated by the airborne action.
+    const startAnchor = entity.startAnchorId ? anchors.get(entity.startAnchorId) : undefined;
+    if (startAnchor?.objectId || document.actions.some(action => action.entityId === entity.id && action.type === 'airborne' && timings.get(action.id)?.start === 0)) continue;
     if (!(navigation ? navigationPointFree(navigation, bundle.initial[entity.id].position, radius, binding.height) : freeGroundPoint(collisionMap, boxes, bundle.initial[entity.id].position, radius, binding.height))) diagnostic('invalid_actor_start', 'Actor start position intersects map geometry, terrain or map bounds.', [entity.id]);
   }
   if (bundle.evaluationVersion === 2 && !validation.diagnostics.some(d => d.severity === 'error')) validation.diagnostics.push(...validatePerformanceClearance(bundle, boxes));
@@ -454,7 +534,9 @@ function semanticTarget(bundle: CompiledCG, entityId: string, state: CgEntitySta
 }
 
 function horizontalFrame(intent: CgCompiledShot['camera'], subject: CgEntityState, secondary?: CgEntityState) {
-  const facing = new Vector3(0, 0, 1).applyQuaternion(new Quaternion().fromArray(subject.quaternion));
+  const facing = intent.reference === 'subject-facing' && subject.faceForward
+    ? new Vector3(...subject.faceForward)
+    : new Vector3(0, 0, 1).applyQuaternion(new Quaternion().fromArray(subject.quaternion));
   facing.y = 0;
   if (facing.lengthSq() < 1e-8) facing.set(0, 0, 1); else facing.normalize();
   let forward = facing;
@@ -549,12 +631,14 @@ function sampleSemanticCamera(bundle: CompiledCG, shot: CgCompiledShot, time: nu
     const frame = horizontalFrame(intent, subject, secondary);
     const offset = semanticOffset(intent, frame.forward, frame.right);
     if (intent.movement === 'orbit') offset.applyAxisAngle(new Vector3(0, 1, 0), (t - 0.5) * Math.PI / 2);
-    const y = intent.pitch !== undefined ? target[1] + Math.sin(intent.pitch) * range : intent.height !== undefined ? subject.position[1] + intent.height : target[1] + (intent.framing === 'wide' ? height * 0.16 : intent.framing === 'close-up' ? 0 : height * 0.08);
+    const baseY = intent.pitch !== undefined ? target[1] + Math.sin(intent.pitch) * range : intent.height !== undefined ? subject.position[1] + intent.height : target[1] + (intent.framing === 'wide' ? height * 0.16 : intent.framing === 'close-up' ? 0 : height * 0.08);
+    const y = intent.movement === 'crane' ? baseY + t * Math.max(height * 1.2, intent.height ?? height * 2.5) : baseY;
     const horizontalRange = range * Math.cos(intent.pitch ?? 0);
     return finishPose([target[0] + offset.x * horizontalRange, y, target[2] + offset.z * horizontalRange], target);
   }
   if (intent.side === 'left') angle = -angle;
-  return finishPose([target[0] + Math.sin(angle) * range * Math.cos(intent.pitch ?? 0), intent.pitch !== undefined ? target[1] + Math.sin(intent.pitch) * range : subject.position[1] + (intent.height ?? height * 0.92), target[2] + Math.cos(angle) * range * Math.cos(intent.pitch ?? 0)], target);
+  const worldY = intent.pitch !== undefined ? target[1] + Math.sin(intent.pitch) * range : subject.position[1] + (intent.height ?? height * 0.92);
+  return finishPose([target[0] + Math.sin(angle) * range * Math.cos(intent.pitch ?? 0), intent.movement === 'crane' ? worldY + t * Math.max(height * 1.2, intent.height ?? height * 2.5) : worldY, target[2] + Math.cos(angle) * range * Math.cos(intent.pitch ?? 0)], target);
 }
 
 function sampleCamera(bundle: CompiledCG, shot: CgCompiledShot, time: number, current?: Record<string, CgEntityState>): CgCameraPose {
@@ -607,7 +691,8 @@ function cameraScore(bundle: CompiledCG, shot: CgCompiledShot, boxes: MapObjectA
       const contactObject = behavior?.type === 'sit' && documentCoveragePurpose(bundle, shot.id) === 'contact' ? behavior.contact?.objectId : undefined;
       const required = [subjectObject!, ...(shot.camera.layout === 'two-shot' ? [bundle.bindings.find(b => b.entityId === shot.camera.secondaryId)?.objectId ?? ''] : []), ...(contactObject ? [contactObject] : [])];
       const items = observeCamera(bundle.map, bundle.bindings, bundle.resources, sampleEntities(bundle, t), pose, 16 / 9, required);
-      if (required.some(id => !items.some(item => item.objectId === id && item.visibleFraction >= (id === contactObject ? 0.15 : 0.55) && item.coverage > 0.005))) continue;
+      const coverageFloor = shot.camera.movement === 'crane' && shot.camera.framing === 'wide' ? 0.001 : 0.005;
+      if (required.some(id => !items.some(item => item.objectId === id && item.visibleFraction >= (id === contactObject ? 0.15 : 0.55) && item.coverage > coverageFloor))) continue;
       if (shot.camera.framing === 'close-up' || ['face', 'eyes'].includes(shot.camera.aim ?? '')) {
         const subject = sampleEntities(bundle, t)[shot.camera.subjectId], face = subject?.landmarks?.eyes;
         if (!face || !items.find(item => item.objectId === subjectObject)?.landmarks?.eyes?.visible) continue;

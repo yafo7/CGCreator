@@ -1,6 +1,7 @@
 import type { EditableMap } from '../shared/map';
 import type { RenderScheme } from '../shared/renderScheme';
 import type { CgMapSyncSummary, CgPatchOperation, CgProject, CgProjectSummary, CgVec3, CompiledCG, DirectorDocument } from '../shared/cgTypes';
+import type { CgGenerationRun } from '../shared/cgRunTypes';
 import { stableHash } from '../shared/cgValidation';
 import { inspectCgView } from '../shared/cgViewSemantics';
 import { buildWorldSemanticIndex } from '../shared/cgWorldSemantics';
@@ -17,7 +18,7 @@ const movement: Record<string, string> = { static: '固定', dolly: '推镜', tr
 const framing: Record<string, string> = { wide: '全景', medium: '中景', 'close-up': '特写', 'over-shoulder': '越肩' };
 const cameraView: Record<string, string> = { front: '正面', 'front-three-quarter': '前侧 3/4', side: '侧面', 'rear-three-quarter': '后侧 3/4', rear: '背面' };
 const cameraAim: Record<string, string> = { body: '全身构图', 'upper-body': '上半身构图', face: '面部对焦', eyes: '眼部对焦', interaction: '互动构图' };
-const actionName: Record<string, string> = { move: '移动', face: '朝向', animate: '动作', visibility: '显隐', effect: '特效', attach: '附着', detach: '分离', sit: '坐下与保持接触', dialogue: '对话表演', hold: '保持状态' };
+const actionName: Record<string, string> = { move: '移动', airborne: '飞身与落地', face: '朝向', animate: '动作', visibility: '显隐', effect: '特效', attach: '道具挂载', detach: '道具分离', handoff: '道具交接', sit: '坐下与保持接触', dialogue: '对话表演', hold: '保持状态' };
 
 export function describeMapSync(summary: CgMapSyncSummary): string {
   const changes = [
@@ -57,6 +58,7 @@ class CgWorkspace {
   private root = document.createElement('section');
   private runtime: CgPlaybackRuntime | null = null;
   private project: CgProject | null = null;
+  private generationRun: CgGenerationRun | null = null;
   private bundle: CompiledCG | null = null;
   private selectedShot = '';
   private selectedBehavior = '';
@@ -94,7 +96,7 @@ class CgWorkspace {
           <label class="cg-label" for="cg-project-select">演出项目</label><div class="cg-project-row"><select id="cg-project-select" data-cg="projects"><option value="">新建 · 当前地图</option></select><button data-do="load" title="打开所选项目">打开</button></div>
           <div data-cg="map-sync" class="cg-map-sync"><span data-cg="map-sync-text">打开项目后检查地图版本</span><button data-do="sync-map" disabled>同步当前地图</button></div>
           <label class="cg-label" for="cg-prompt">描述这一段故事</label><textarea id="cg-prompt" data-cg="prompt" rows="5" placeholder="角色走向场景中央，镜头缓缓跟随。角色停下后，切到面部特写，停留片刻。"></textarea>
-          <button data-do="plan" class="cg-primary cg-full">✦ 生成导演文档</button>
+          <button data-do="plan" class="cg-primary cg-full">✦ 一键生成可播放 CG</button>
           <button data-do="demo" class="cg-demo cg-full">体验内置演出 · 无需 AI 服务</button>
           <button data-do="foundation-demo" class="cg-demo cg-full">基础闭环演示 · 跑步、对话、坐下</button>
           <p class="cg-help">从当前地图开始。角色、道具和运镜被编译成可编辑的实时演出。</p>
@@ -110,6 +112,7 @@ class CgWorkspace {
           <div data-cg="shots" class="cg-shot-list"><div class="cg-empty">写下导演意图，或体验内置演出。镜头与动作将在这里展开。</div></div>
           <div class="cg-panel-heading cg-divider"><span>角色与资源</span><span data-cg="resource-count" class="cg-muted">0</span></div><div data-cg="entities" class="cg-entities"></div>
           <details class="cg-semantic" open><summary>已求解的演出行为</summary><div data-cg="performance" class="cg-semantic-list">编译后显示行为时间、接触和镜头选择。</div></details>
+          <details class="cg-semantic" open><summary>多 Agent 制作流程</summary><div data-cg="agent-run" class="cg-semantic-list">等待生成。地图、资源、表演与摄影会按依赖顺序协作。</div></details>
         </aside>
         <main class="cg-center">
           <div class="cg-view" data-cg="view"><canvas data-cg="canvas" aria-label="可交互的 3D 演出预览"></canvas>
@@ -270,8 +273,11 @@ class CgWorkspace {
     }); return; }
     if (action === 'load') { await this.run('正在打开已保存的演出…', async () => {
       const id = this.el<HTMLSelectElement>('projects').value;
-      if (!id) { await this.resetScene(this.options.map, this.options.scheme); this.project = null; this.selectedShot = ''; this.text('source', this.options.map.name); this.renderDocument(); this.status('已切换为新建项目；下一次生成将使用进入工作区时的地图快照。'); return; }
+      if (!id) { await this.resetScene(this.options.map, this.options.scheme); this.project = null; this.generationRun = null; this.selectedShot = ''; this.text('source', this.options.map.name); this.renderDocument(); this.status('已切换为新建项目；下一次生成将使用进入工作区时的地图快照。'); return; }
       await this.present(await this.request<CgProject>(`/projects/${encodeURIComponent(id)}`), true);
+      const history = await this.request<{ runs: CgGenerationRun[] }>(`/projects/${encodeURIComponent(id)}/runs`);
+      this.generationRun = history.runs[0] ?? null;
+      this.renderDocument();
       this.status('项目已恢复。导演文档、资源和已确认版本均保存在本地。');
     }); return; }
     if (action === 'sync-map') { await this.run('正在同步 WorldForge 地图并重新编译…', async () => {
@@ -292,10 +298,22 @@ class CgWorkspace {
       const prompt = this.el<HTMLTextAreaElement>('prompt').value.trim();
       if (action === 'plan' && !prompt) throw new Error('请先描述剧情或导演意图。');
       if (!this.project) this.project = await this.request<CgProject>('/projects', { map: this.options.map, scheme: this.options.scheme, title: prompt.slice(0, 32) || '内置演出' });
-      const project = await this.request<CgProject>(`/projects/${this.project.id}/plan`, { revision: this.project.revision, prompt: prompt || '角色走向场景中央，跟拍后切换特写。', demo: action === 'demo' });
-      await this.present(project);
-      await this.compile();
-      await this.refreshProjects();
+      this.progressId = window.setInterval(() => {
+        if (!this.project || this.closed) return;
+        void this.request<{ stage: string; message: string; running: boolean }>(`/projects/${this.project.id}/progress`).then(progress => { if (progress.running && !this.closed) this.status(progress.message || progress.stage); }).catch(() => undefined);
+      }, 700);
+      try {
+        const result = await this.request<{ run: CgGenerationRun; project: CgProject }>(`/projects/${this.project.id}/runs`, { revision: this.project.revision, prompt: prompt || '角色走向场景中央，跟拍后切换特写。', demo: action === 'demo' });
+        this.generationRun = result.run;
+        await this.present(result.project, true);
+        this.status(`完整制作流程已通过 · ${result.project.candidate?.duration.toFixed(2) ?? '0.00'} 秒 · 可以直接预览，确认后即可导出。`);
+        await this.refreshProjects();
+      } catch (error) {
+        const history = await this.request<{ runs: CgGenerationRun[] }>(`/projects/${this.project.id}/runs`).catch(() => ({ runs: [] }));
+        this.generationRun = history.runs[0] ?? null;
+        this.renderDocument();
+        throw error;
+      } finally { clearInterval(this.progressId); this.progressId = 0; }
     }); return; }
     if (action === 'prepare-asset') { await this.run('正在制作演出资源…', async () => {
       const description = this.el<HTMLInputElement>('prep-description').value.trim();
@@ -340,6 +358,7 @@ class CgWorkspace {
     if (action === 'confirm') { await this.run('正在确认当前预览版本…', async () => {
       const candidate = this.project!.candidate!;
       await this.present(await this.request<CgProject>(`/projects/${this.project!.id}/confirm`, { revision: this.project!.revision, compileId: candidate.id, inputHash: candidate.inputHash }));
+      if (this.generationRun?.status === 'preview-ready') { this.generationRun.status = 'confirmed'; this.generationRun.phase = 'confirmed'; this.renderDocument(); }
       this.status(`已确认「${this.project!.title}」。当前编译、验证和预览属于同一版本，可导出播放。`);
       await this.refreshProjects();
     }); return; }
@@ -454,9 +473,12 @@ class CgWorkspace {
     this.text('document', doc ? JSON.stringify(doc, null, 2) : '等待生成');
     const performance = this.project?.candidate?.performance ?? this.bundle?.performance;
     const candidate = this.project?.candidate ?? this.bundle;
-    this.el('performance').innerHTML = performance && candidate ? `<p>演出时长 ${seconds(performance.duration)} 秒 · ${candidate.stage === 'performance' ? '行为阶段，镜头待编译' : '完整编译'}</p>${candidate.actions.filter(a => ['move', 'sit', 'dialogue', 'hold'].includes(a.type)).map(a => `<div><strong>${escape(actionName[a.type])} · ${escape(a.id)}</strong><small>${seconds(a.start)}–${seconds(a.end)} 秒${a.route ? ` · 道路 ${escape(a.route.guideIds.join(', '))}` : ''}${a.contact ? ` · 接触 ${escape(a.contact.objectId)}/${escape(a.contact.nodeId)}` : ''}</small></div>`).join('')}${candidate.shots.map(s => `<div><strong>${escape(s.id)}</strong><small>行为 ${escape(s.behaviorId ?? '未指定')} · 镜头 ${escape(s.skillId ?? '手工意图')}</small></div>`).join('')}` : '当前为旧版或尚未编译的演出。';
+    this.el('performance').innerHTML = performance && candidate ? `<p>演出时长 ${seconds(performance.duration)} 秒 · ${candidate.stage === 'performance' ? '行为阶段，镜头待编译' : '完整编译'}</p>${candidate.actions.filter(a => ['move', 'airborne', 'sit', 'dialogue', 'handoff', 'hold'].includes(a.type)).map(a => `<div><strong>${escape(actionName[a.type])} · ${escape(a.id)}</strong><small>${seconds(a.start)}–${seconds(a.end)} 秒${a.route ? ` · 道路 ${escape(a.route.guideIds.join(', '))}` : ''}${a.contact ? ` · 接触 ${escape(a.contact.objectId)}/${escape(a.contact.nodeId)}` : ''}</small></div>`).join('')}${candidate.shots.map(s => `<div><strong>${escape(s.id)}</strong><small>行为 ${escape(s.behaviorId ?? '未指定')} · 镜头 ${escape(s.skillId ?? '手工意图')}</small></div>`).join('')}` : '当前为旧版或尚未编译的演出。';
     const validation = this.project?.candidate?.validation ?? this.bundle?.validation;
-    if (doc?.schemaVersion === 2) this.el('performance').insertAdjacentHTML('afterbegin', `<div class="cg-chips">${doc.actions.filter(a => ['move', 'sit', 'dialogue', 'hold'].includes(a.type)).map(a => `<button data-do="behavior" data-id="${escape(a.id)}">${escape(actionName[a.type])}</button>`).join('')}</div>`);
+    if (doc?.schemaVersion === 2) this.el('performance').insertAdjacentHTML('afterbegin', `<div class="cg-chips">${doc.actions.filter(a => ['move', 'airborne', 'sit', 'dialogue', 'handoff', 'hold'].includes(a.type)).map(a => `<button data-do="behavior" data-id="${escape(a.id)}">${escape(actionName[a.type])}</button>`).join('')}</div>`);
+    const run = this.generationRun;
+    const phaseNames: Record<string, string> = { 'world-bootstrap': '理解地图', preproduction: '分析剧情', 'world-deep-read': '核实位置', production: '准备角色、道具与动作', readiness: '检查准备门', 'director-final': '冻结导演文档', performance: '编排演出', camera: '设计镜头', negotiation: '导演仲裁', compile: '确定性编译', validate: '检查演出', preview: '可以预览' };
+    this.el('agent-run').innerHTML = run ? `<p>Run ${escape(run.id)} · ${escape(run.status)}</p>${run.tasks.map(task => `<div><strong>${task.status === 'completed' ? '✓' : task.status === 'running' ? '●' : task.status === 'failed' ? '!' : '○'} ${escape(phaseNames[task.id] ?? task.label)}</strong><small>${escape(task.agent)}${task.error ? ` · ${escape(task.error.message)}` : ''}</small></div>`).join('')}${run.diagnostics.length ? `<p>${run.diagnostics.length} 条诊断已按 owner 分派。</p>` : ''}` : '等待生成。地图、资源、表演与摄影会按依赖顺序协作。';
     this.el('diagnostics').hidden = !validation?.diagnostics.length;
     this.el('diagnostics').innerHTML = validation?.diagnostics.map(item => `<div class="${item.severity === 'error' ? 'cg-error' : ''}"><strong>${item.severity === 'error' ? '错误' : '提示'} · ${escape(item.code)}</strong> ${escape(item.message)} <small>${escape(item.nodeIds.join(', '))}</small></div>`).join('') ?? '';
     this.renderTimeline();

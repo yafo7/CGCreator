@@ -328,14 +328,14 @@ describe('CG deterministic compiler', () => {
     expect(map.objects.find((o) => o.id === 'marker')!.transform.position).toEqual([0, 0, 0]);
   });
 
-  it('validates missing resources, overlapping channels and unsupported operations', () => {
+  it('validates missing resources, overlapping channels and invalid attachment ownership', () => {
     const { document, map } = fixture();
     document.actions.push({ ...document.actions[0], id: 'walk-again', duration: 2 });
     expect(compileDirector(document, map).validation.diagnostics.some((d) => d.code === 'action_channel_overlap')).toBe(true);
     map.assets = [];
     expect(compileDirector(document, map).validation.diagnostics.some((d) => d.code === 'missing_model')).toBe(true);
     document.actions[1].type = 'attach';
-    expect(validateDirectorDocument(document).diagnostics.some((d) => d.code === 'unsupported_attachment')).toBe(true);
+    expect(validateDirectorDocument(document).diagnostics.some((d) => d.code === 'invalid_document')).toBe(true);
   });
 
   it('rejects invalid baked tracks instead of claiming a playable animation', () => {

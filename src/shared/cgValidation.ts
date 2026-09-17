@@ -79,7 +79,7 @@ export function validateDirectorDocument(value: unknown, options: { allowNoShots
     if (['two-shot', 'over-shoulder'].includes(c.layout) && (!c.secondaryId || c.secondaryId === c.subjectId)) error('Two-person composition requires distinct subjects.', s.id);
     if (c.aimMode !== undefined && !one(c.aimMode, ['fixed', 'follow'])) error('Unknown camera aim mode.', s.id);
     if (c.pitch !== undefined && (!finite(c.pitch) || Math.abs(c.pitch) > Math.PI / 2 - 0.01)) error('Camera pitch must be within the supported radians range.', s.id);
-    if (!one(c.movement, ['static', 'dolly', 'tracking', 'orbit']) || !one(c.framing, ['wide', 'medium', 'close-up', 'over-shoulder'])) error('Unsupported camera movement or framing.', s.id, 'unsupported_camera');
+    if (!one(c.movement, ['static', 'dolly', 'tracking', 'orbit', 'crane']) || !one(c.framing, ['wide', 'medium', 'close-up', 'over-shoulder'])) error('Unsupported camera movement or framing.', s.id, 'unsupported_camera');
     if (!entities.has(c.subjectId) || (c.secondaryId !== undefined && !entities.has(c.secondaryId))) error('Camera references an unknown entity.', s.id, 'missing_reference');
     if (c.framing === 'over-shoulder' && (!c.secondaryId || c.secondaryId === c.subjectId)) error('Over-shoulder needs two distinct entity IDs.', s.id);
     if (c.side !== undefined && !one(c.side, ['left', 'right'])) error('Camera side must be left or right.', s.id);
@@ -105,9 +105,9 @@ export function validateDirectorDocument(value: unknown, options: { allowNoShots
     if (s.subtitle !== undefined && typeof s.subtitle !== 'string') error('Subtitle must be a string.', s.id);
   }
   for (const a of d.actions) {
-    keys(a, ['id', 'entityId', 'type', 'start', 'duration', 'targetAnchorId', 'targetEntityId', 'clipId', 'visible', 'effect', 'socketId', ...(d.schemaVersion === 2 ? ['route', 'interaction', 'endBehavior', 'purpose'] : [])], 'action');
+    keys(a, ['id', 'entityId', 'type', 'start', 'duration', 'targetAnchorId', 'targetEntityId', 'clipId', 'visible', 'effect', 'socketId', 'sourceEntityId', 'arcHeight', ...(d.schemaVersion === 2 ? ['route', 'interaction', 'propEntityId', 'endBehavior', 'purpose'] : [])], 'action');
     if (!entities.has(a.entityId)) error('Action references an unknown entity.', a.id, 'missing_reference');
-    if (!one(a.type, ['move', 'face', 'animate', 'visibility', 'effect', 'attach', 'detach', ...(d.schemaVersion === 2 ? ['sit', 'dialogue', 'hold'] : [])])) error('Unknown action type.', a.id, 'unsupported_action');
+    if (!one(a.type, ['move', 'face', 'animate', 'visibility', 'effect', 'attach', 'detach', ...(d.schemaVersion === 2 ? ['airborne', 'handoff', 'sit', 'dialogue', 'hold'] : [])])) error('Unknown action type.', a.id, 'unsupported_action');
     if (a.purpose !== undefined && (typeof a.purpose !== 'string' || a.purpose.length > 2000)) error('Behavior purpose must be a bounded string.', a.id);
     if (a.route !== undefined) {
       if (a.type !== 'move' || !record(a.route)) error('Only a move can declare a route.', a.id);
@@ -117,6 +117,22 @@ export function validateDirectorDocument(value: unknown, options: { allowNoShots
         if (!one(a.route.policy, ['required', 'preferred']) || !one(a.route.locomotion, ['walk', 'run'])) error('Invalid route policy or locomotion.', a.id);
         if (a.route.maxSpeed !== undefined && (!finite(a.route.maxSpeed) || a.route.maxSpeed <= 0 || a.route.maxSpeed > 15)) error('Invalid route maximum speed.', a.id);
       }
+    }
+    if (a.arcHeight !== undefined && (!finite(a.arcHeight) || a.arcHeight <= 0 || a.arcHeight > 100)) error('Airborne arc height must be finite and within (0,100].', a.id);
+    if (a.type === 'airborne') {
+      if (entities.get(a.entityId)?.kind !== 'actor' || !a.targetAnchorId) error('Airborne action requires an actor and an exact landing anchor.', a.id);
+      if (a.route !== undefined) error('Airborne action cannot use a ground navigation route.', a.id);
+    } else if (a.arcHeight !== undefined) error('Only airborne actions may declare an arc height.', a.id);
+    if (a.type === 'attach') {
+      if (entities.get(a.entityId)?.kind !== 'prop' || !entities.has(a.targetEntityId) || !id(a.socketId)) error('Attach requires a prop, a known owner and a named socket.', a.id);
+    }
+    if (a.type === 'detach' && entities.get(a.entityId)?.kind !== 'prop') error('Detach requires a prop entity.', a.id);
+    if (a.type === 'handoff') {
+      if (entities.get(a.entityId)?.kind !== 'prop' || !entities.has(a.sourceEntityId) || !entities.has(a.targetEntityId) || a.sourceEntityId === a.targetEntityId || !id(a.socketId)) error('Handoff requires one prop, distinct known source/target actors and a receiving socket.', a.id);
+    } else if (a.sourceEntityId !== undefined) error('Only handoff actions may declare sourceEntityId.', a.id);
+    if (a.propEntityId !== undefined) {
+      if (a.type !== 'animate' || entities.get(a.propEntityId)?.kind !== 'prop') error('propEntityId is supported only on an actor animation and must reference a prop.', a.id);
+      if (entities.get(a.entityId)?.kind !== 'actor') error('A prop-informed animation requires an actor entity.', a.id);
     }
     if (a.endBehavior !== undefined && (!['animate', 'sit'].includes(a.type) || !one(a.endBehavior, ['restore', 'hold']))) error('Unsupported end-pose behavior.', a.id);
     if (a.type === 'sit') {
@@ -128,7 +144,7 @@ export function validateDirectorDocument(value: unknown, options: { allowNoShots
       if (!finite(a.duration) || a.duration <= 0 || a.endBehavior === 'restore') error('Sit needs positive duration and a persistent seated pose.', a.id);
     } else if (a.interaction !== undefined) error('Only sit currently supports an interaction binding.', a.id);
     if (a.type === 'dialogue' && (!entities.has(a.targetEntityId) || a.targetEntityId === a.entityId)) error('Dialogue requires another known participant.', a.id);
-    if (!finite(a.duration) || a.duration < 0 || a.duration > 1200 || (['move', 'animate', 'effect'].includes(a.type) && a.duration === 0)) error('Action duration is invalid.', a.id);
+    if (!finite(a.duration) || a.duration < 0 || a.duration > 1200 || (['move', 'airborne', 'animate', 'effect', 'handoff'].includes(a.type) && a.duration === 0)) error('Action duration is invalid.', a.id);
     if (!record(a.start)) error('Action start must be a temporal reference.', a.id);
     else {
       keys(a.start, a.start.kind === 'absolute' ? ['kind', 'seconds'] : ['kind', 'id', 'offset'], 'start');
@@ -147,7 +163,6 @@ export function validateDirectorDocument(value: unknown, options: { allowNoShots
     if (a.type === 'animate' && !id(a.clipId)) error('Animate requires clipId.', a.id);
     if (a.type === 'visibility' && typeof a.visible !== 'boolean') error('Visibility requires a boolean value.', a.id);
     if (a.type === 'effect' && a.effect !== 'spark') error('Only the deterministic spark effect is supported.', a.id, 'unsupported_effect');
-    if (a.type === 'attach' || a.type === 'detach') error('Socket attachment requires a verified named-node binding and is not supported by this compiler version.', a.id, 'unsupported_attachment');
   }
   for (const c of d.constraints) {
     keys(c, ['id', 'source', 'strength', 'type', 'targetId', 'anchorId', 'seconds', 'edge', 'scope', 'order'], 'constraint');
